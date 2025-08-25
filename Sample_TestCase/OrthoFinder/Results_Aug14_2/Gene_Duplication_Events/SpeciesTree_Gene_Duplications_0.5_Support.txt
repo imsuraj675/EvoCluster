@@ -1,0 +1,1 @@
+(Mycoplasma_hyopneumoniae_AE017243_75:0.5,(Mycoplasma_agalactiae_5632_FP671138_109:1,Mycoplasma_genitalium_uid97_L43967_12:1)N1_2:0.5)N0_0;

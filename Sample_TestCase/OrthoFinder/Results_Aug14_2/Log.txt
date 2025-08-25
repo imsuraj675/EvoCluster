@@ -1,0 +1,21 @@
+2025-08-14 09:20:56 : Started OrthoFinder version 3.1.0.post1.dev3
+Command Line: /usr/local/bin/orthofinder -f Sample_TestCase
+
+Search program: diamond
+MSA program: famsa
+Tree program: fasttree
+Scoring matrix: BLOSUM62
+Gap extend: 1
+Gap open: 11
+
+WorkingDirectory_Base: /content/drive/MyDrive/ColabNotebooks/Sample_TestCase/OrthoFinder/Results_Aug14_2/WorkingDirectory/
+
+Species used: 
+0: Mycoplasma_agalactiae_5632_FP671138.faa
+1: Mycoplasma_genitalium_uid97_L43967.faa
+2: Mycoplasma_hyopneumoniae_AE017243.faa
+
+FN_Orthogroups: /content/drive/MyDrive/ColabNotebooks/Sample_TestCase/OrthoFinder/Results_Aug14_2/WorkingDirectory/clusters_OrthoFinder_I1.2.txt_id_pairs.txt
+WorkingDirectory_Trees: /content/drive/MyDrive/ColabNotebooks/Sample_TestCase/OrthoFinder/Results_Aug14_2/WorkingDirectory/
+FN_Orthogroups: /content/drive/MyDrive/ColabNotebooks/Sample_TestCase/OrthoFinder/Results_Aug14_2/WorkingDirectory/clusters_OrthoFinder_I1.2.txt_id_pairs.txt
+2025-08-14 09:22:42 : OrthoFinder run completed
