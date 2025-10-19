@@ -20,6 +20,9 @@ def prep_data_fn(fasta_aln_file):
     file_location  = os.path.dirname(fasta_aln_file) 
     base_file_name = os.path.splitext(os.path.basename(fasta_aln_file))[0]
 
+    # replace X with gaps
+    utils.replace_X_with_gaps(fasta_aln_file)
+
     # check for illegal AA
     check_aa = utils.aa_check(fasta_aln_file)
     if not check_aa:

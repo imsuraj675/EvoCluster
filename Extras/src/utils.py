@@ -22,11 +22,23 @@ def std_gap_chars(extant_fasta_file,fasta_file_name_std_gap,gap_character):
     outfile.close()
     print(f"Gaps are standardised and new file {fasta_file_name_std_gap} is created")
 
+''' function to replace x/X with gaps '''
+def replace_X_with_gaps(extant_fasta_file):
+    temp_fasta_file = extant_fasta_file + ".tmp"
+    with FastxFile(extant_fasta_file, 'r') as fh, open(temp_fasta_file, 'w') as outfile:
+        for entry in fh:
+          outfile.write('>' + str(entry.name) + '\n')
+          outfile.write(str(entry.sequence.upper().replace("X","-"))  + '\n')
+    fh.close()
+    outfile.close()
+    os.replace(temp_fasta_file, extant_fasta_file)
+    print(f"Replaced X with gaps in file {extant_fasta_file}")
+
 ''' function to check whether no standard amino acids present '''
 def aa_check(extant_fasta_file):
   with FastxFile(extant_fasta_file, 'r') as fh:
     for entry in fh:
-      for s in [*entry.sequence]:
+      for s in entry.sequence.upper():
         if s not in allowed_aa_chars:
          print(f"Found illegal aa character {s}")
          return 0
@@ -55,7 +67,7 @@ def remove_gaps(extant_fasta_file,fasta_file_name_wo_gap,gap_character):
 
 ''' function to create LG tree'''
 def create_lg_tree(aln_fasta_file,nwk_file_name):
-    fasttree_cmd = "FastTree -seed {rand_seed} -quiet -lg {input_file} > {output_file}".format(rand_seed=0,input_file = aln_fasta_file,output_file = nwk_file_name)
+    fasttree_cmd = "FastTree -seed {rand_seed} -fastest -quiet -lg {input_file} > {output_file}".format(rand_seed=0,input_file = aln_fasta_file,output_file = nwk_file_name)
     subprocess.run(fasttree_cmd,shell=True)
     print(f"Created Phylogenetic Tree for {aln_fasta_file}.")
 
