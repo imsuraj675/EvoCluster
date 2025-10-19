@@ -82,27 +82,31 @@ def create_ref_idx(fasta_file):
     return seq_ref_dict
 
 ''' function to generate LG matrix '''
-def generate_lg_matrix(seq_ref_dict,nwk_file_name):
-   
-    extant_sequence_names = list(seq_ref_dict.keys())
-    cophenetic_dist_np    = np.zeros((len(extant_sequence_names),len(extant_sequence_names)))
+from ete3 import Tree
+import numpy as np
 
+def generate_lg_matrix(seq_ref_dict, nwk_file_name):
+    # Load tree
+    phl_tree = Tree(nwk_file_name, format=1)
     
-    phl_tree = Tree(nwk_file_name,format=1)
-
-    for ref_num,ref_extant_sequence in enumerate(extant_sequence_names):
-        for other_extant_sequence in extant_sequence_names[ref_num:]:
-        
-            ref_extant_sequence_t = phl_tree&ref_extant_sequence
-            other_extant_sequence_t = phl_tree&other_extant_sequence
-            dis_node = ref_extant_sequence_t.get_distance(other_extant_sequence_t)
-
-            ref_idx = seq_ref_dict[ref_extant_sequence]
-            other_idx = seq_ref_dict[other_extant_sequence]
-
-            cophenetic_dist_np[ref_idx][other_idx] = dis_node
-            cophenetic_dist_np[other_idx][ref_idx] = dis_node
+    # Get sequence names in the same order as seq_ref_dict keys
+    extant_sequence_names = list(seq_ref_dict.keys())
+    
+    # ETE3 computes pairwise distances between all leaves in one go
+    dist_dict, name_order = phl_tree.get_distance_matrix(extant_sequence_names)
+    
+    # Convert to NumPy array in the same order as seq_ref_dict
+    N = len(extant_sequence_names)
+    cophenetic_dist_np = np.zeros((N, N))
+    
+    for i, name_i in enumerate(name_order):
+        idx_i = seq_ref_dict[name_i]
+        for j, name_j in enumerate(name_order):
+            idx_j = seq_ref_dict[name_j]
+            cophenetic_dist_np[idx_i, idx_j] = dist_dict[name_i][name_j]
+    
     return cophenetic_dist_np
+
 
 ''' function to shuffle amino acids in the protein sequence '''
 def shuff(seq,shuff_percent):
