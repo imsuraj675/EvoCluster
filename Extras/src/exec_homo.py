@@ -99,4 +99,5 @@ for ax, (align_type, metric, title) in zip(axes.flatten(), plot_config):
     ax.legend(fontsize=9)
 
 plt.tight_layout()
+plt.savefig(f"{pfam_id}_hm_correlation_analysis.png", dpi=300)
 plt.show()
