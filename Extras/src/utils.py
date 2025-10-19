@@ -81,32 +81,47 @@ def create_ref_idx(fasta_file):
             idx_no = idx_no + 1  
     return seq_ref_dict
 
-''' function to generate LG matrix '''
-from ete3 import Tree
-import numpy as np
+from multiprocessing import Pool, cpu_count
+
+def _pair_distance(args):
+    """Helper function to compute distance between a pair of sequences."""
+    tree, seq1, seq2, seq_ref_dict = args
+    node1 = tree & seq1
+    node2 = tree & seq2
+    dist = node1.get_distance(node2)
+    idx1 = seq_ref_dict[seq1]
+    idx2 = seq_ref_dict[seq2]
+    return (idx1, idx2, dist)
 
 def generate_lg_matrix(seq_ref_dict, nwk_file_name):
-    # Load tree
-    phl_tree = Tree(nwk_file_name, format=1)
-    
-    # Get sequence names in the same order as seq_ref_dict keys
+    """
+    Generate LG cophenetic distance matrix using multiprocessing.
+    """
     extant_sequence_names = list(seq_ref_dict.keys())
-    
-    # ETE3 computes pairwise distances between all leaves in one go
-    dist_dict, name_order = phl_tree.get_distance_matrix(extant_sequence_names)
-    
-    # Convert to NumPy array in the same order as seq_ref_dict
-    N = len(extant_sequence_names)
-    cophenetic_dist_np = np.zeros((N, N))
-    
-    for i, name_i in enumerate(name_order):
-        idx_i = seq_ref_dict[name_i]
-        for j, name_j in enumerate(name_order):
-            idx_j = seq_ref_dict[name_j]
-            cophenetic_dist_np[idx_i, idx_j] = dist_dict[name_i][name_j]
-    
-    return cophenetic_dist_np
+    n = len(extant_sequence_names)
+    cophenetic_dist_np = np.zeros((n, n))
 
+    # Load tree once
+    phl_tree = Tree(nwk_file_name, format=1)
+
+    # Prepare all pairs (upper triangle only)
+    pairs = []
+    for i, ref in enumerate(extant_sequence_names):
+        for other in extant_sequence_names[i:]:
+            pairs.append((phl_tree, ref, other, seq_ref_dict))
+
+    # Use multiprocessing
+    pool = Pool(processes=cpu_count())
+    results = pool.map(_pair_distance, pairs)
+    pool.close()
+    pool.join()
+
+    # Fill matrix
+    for idx1, idx2, dist in results:
+        cophenetic_dist_np[idx1, idx2] = dist
+        cophenetic_dist_np[idx2, idx1] = dist
+
+    return cophenetic_dist_np
 
 ''' function to shuffle amino acids in the protein sequence '''
 def shuff(seq,shuff_percent):

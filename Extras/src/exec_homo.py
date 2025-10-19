@@ -3,6 +3,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from homology_corr import hm_correlation_analysis
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===========================
 # Input handling
@@ -31,10 +32,10 @@ if not os.path.exists(full_file):
 # ===========================
 models = ["esm2", "esmc", "pt", "msa"]
 colors = {
-    "esm2": "#4fa3ff",     # blue
-    "esmc": "#ffb347",     # orange
-    "pt": "#8cff9f",       # green
-    "msa": "#ff66c4"       # pink
+    "esm2": "#4fa3ff",
+    "esmc": "#ffb347",
+    "pt": "#8cff9f",
+    "msa": "#ff66c4"
 }
 
 # ===========================
@@ -48,24 +49,35 @@ alignments = {
 results = {align_type: {} for align_type in alignments}
 
 # ===========================
-# Run correlation analysis
+# Function for parallel processing
 # ===========================
-for align_type, fasta_aln_file in alignments.items():
-    for model in models:
-        print(f"Running correlation analysis for {model.upper()} using {align_type} alignment ({fasta_aln_file}) ...")
+def process_model(align_type, fasta_aln_file, model):
+    print(f"Running correlation analysis for {model.upper()} using {align_type} alignment ({fasta_aln_file}) ...")
+    rho_layer_corr, pearson_layer_corr = hm_correlation_analysis(
+        fasta_aln_file, model, shuffle, colattn
+    )
+    return align_type, model, {
+        "order": np.array(rho_layer_corr),
+        "mag": np.array(pearson_layer_corr)
+    }
 
-        rho_layer_corr, pearson_layer_corr = hm_correlation_analysis(
-            fasta_aln_file, model, shuffle, colattn
-        )
-        results[align_type][model] = {
-            "order": np.array(rho_layer_corr),
-            "mag": np.array(pearson_layer_corr)
-        }
+# ===========================
+# Run correlation analysis in parallel
+# ===========================
+futures = []
+with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+    for align_type, fasta_aln_file in alignments.items():
+        for model in models:
+            futures.append(executor.submit(process_model, align_type, fasta_aln_file, model))
+
+for future in as_completed(futures):
+    align_type, model, data = future.result()
+    results[align_type][model] = data
 
 print("\nAll models and alignments processed successfully.\n")
 
 # ===========================
-# Plot results (4 graphs)
+# Plot results
 # ===========================
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
