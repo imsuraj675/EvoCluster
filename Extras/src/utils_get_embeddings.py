@@ -12,7 +12,7 @@ import numpy as np
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 total_layers_model = {'msa':13,'esm2':31,'esm1':34,'pt':25, 'esmc': 31}
-full_model_name = {'msa':'esm_msa1b_t12_100M_UR50S','esm2':'esm2_t30_150M_UR50D', 'esm1':'esm1b_t33_650M_UR50','pt':'Rostlab/prot_t5_xl_uniref50', 'esmc':"ESMC"}
+full_model_name = {'msa':'esm_msa1b_t12_100M_UR50S','esm2':'esm2_t30_150M_UR50D', 'esm1':'esm1b_t33_650M_UR50S','pt':'Rostlab/prot_t5_xl_uniref50', 'esmc':"ESMC"}
 
 # Our Code
 def check_seq_len(fasta_file):
@@ -62,7 +62,7 @@ def get_plm_representation(model_type,fasta_file_wo_gap,fasta_file_std_gap,layer
         PLM_dataset = utils_embeddings.get_esm_embedding(fasta_file_wo_gap,esm_model,esm_alphabet,output_layers,device)
 
     if model_type == 'esm1':
-        model_name = 'esm1b_t33_650M_UR50'
+        model_name = 'esm1b_t33_650M_UR50S'
         esm_model, esm_alphabet = pretrained.load_model_and_alphabet(model_name)
         esm_model.to(device)
         esm_model.eval()

@@ -21,7 +21,7 @@ shuffle = "N"
 colattn = "N"
 
 # Output directory
-os.makedirs("results", exist_ok=True)
+os.makedirs("./results", exist_ok=True)
 
 # ===========================
 # Thread-safe counters
