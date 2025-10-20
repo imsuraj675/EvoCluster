@@ -7,7 +7,7 @@ import utils_get_embeddings
 import getopt, pickle
 from local_homolog_sim import local_sim_analysis
 
-model_layer_plm_repr = {'msa':12,'esm2':30,'pt':24, 'esmc':30}
+model_layer_plm_repr = {'msa':12,'esm2':30,'esm1':33,'pt':24, 'esmc':30}
 
 # help function
 def help():
