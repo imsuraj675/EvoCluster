@@ -84,7 +84,7 @@ def create_ref_idx(fasta_file):
 # from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
-def generate_lg_matrix_fast(seq_ref_dict, nwk_file_name):
+def generate_lg_matrix(seq_ref_dict, nwk_file_name):
     """
     Efficiently compute cophenetic distance matrix without repeated get_distance().
     Uses single tree traversal and LCA path-length logic.
