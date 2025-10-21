@@ -82,44 +82,72 @@ def create_ref_idx(fasta_file):
     return seq_ref_dict
 
 from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+
+_global_tree = None
+_global_seq_ref_dict = None
+
+def _init_worker(nwk_file_name, seq_ref_dict):
+    """Initialize each worker with a copy of the tree and seq_ref_dict."""
+    global _global_tree, _global_seq_ref_dict
+    _global_tree = Tree(nwk_file_name, format=1)
+    _global_seq_ref_dict = seq_ref_dict
+
 
 def _pair_distance(args):
-    """Helper function to compute distance between a pair of sequences."""
-    tree, seq1, seq2, seq_ref_dict = args
-    node1 = tree & seq1
-    node2 = tree & seq2
+    """Compute distance between two sequences using global tree."""
+    seq1, seq2 = args
+    node1 = _global_tree & seq1
+    node2 = _global_tree & seq2
     dist = node1.get_distance(node2)
-    idx1 = seq_ref_dict[seq1]
-    idx2 = seq_ref_dict[seq2]
+    idx1 = _global_seq_ref_dict[seq1]
+    idx2 = _global_seq_ref_dict[seq2]
     return (idx1, idx2, dist)
 
-def generate_lg_matrix(seq_ref_dict, nwk_file_name):
+
+def generate_lg_matrix(seq_ref_dict, nwk_file_name, checkpoint_path="cophenetic_checkpoint.npy"):
     """
-    Generate LG cophenetic distance matrix using multiprocessing.
+    Generate cophenetic distance matrix efficiently with multiprocessing,
+    progress bar, and checkpointing for resumption.
     """
     extant_sequence_names = list(seq_ref_dict.keys())
     n = len(extant_sequence_names)
     cophenetic_dist_np = np.zeros((n, n))
 
-    # Load tree once
-    phl_tree = Tree(nwk_file_name, format=1)
+    # Prepare all (i, j) pairs for upper triangle
+    pairs = [(extant_sequence_names[i], extant_sequence_names[j])
+             for i in range(n)
+             for j in range(i, n)]
 
-    # Prepare all pairs (upper triangle only)
-    pairs = []
-    for i, ref in enumerate(extant_sequence_names):
-        for other in extant_sequence_names[i:]:
-            pairs.append((phl_tree, ref, other, seq_ref_dict))
+    # Resume if checkpoint exists
+    completed_pairs = set()
+    if os.path.exists(checkpoint_path):
+        print(f"🔁 Resuming from checkpoint: {checkpoint_path}")
+        cophenetic_dist_np = np.load(checkpoint_path)
+        # Identify completed pairs from nonzero distances
+        completed_pairs = {(i, j) for i in range(n) for j in range(i, n)
+                           if cophenetic_dist_np[i, j] != 0}
+        pairs = [(a, b) for (a, b) in pairs if (_global_seq_ref_dict[a], _global_seq_ref_dict[b]) not in completed_pairs]
 
-    # Use multiprocessing
-    pool = Pool(processes=cpu_count())
-    results = pool.map(_pair_distance, pairs)
-    pool.close()
-    pool.join()
+    # Parallel processing with progress bar
+    total_pairs = len(pairs)
+    with Pool(processes=cpu_count(),
+              initializer=_init_worker,
+              initargs=(nwk_file_name, seq_ref_dict)) as pool:
+        
+        with tqdm(total=total_pairs, desc="Computing distances", dynamic_ncols=True) as pbar:
+            for idx1, idx2, dist in pool.imap_unordered(_pair_distance, pairs, chunksize=100):
+                cophenetic_dist_np[idx1, idx2] = dist
+                cophenetic_dist_np[idx2, idx1] = dist
+                pbar.update(1)
 
-    # Fill matrix
-    for idx1, idx2, dist in results:
-        cophenetic_dist_np[idx1, idx2] = dist
-        cophenetic_dist_np[idx2, idx1] = dist
+                # Periodically save progress (every 10k pairs)
+                if pbar.n % 10000 == 0:
+                    np.save(checkpoint_path, cophenetic_dist_np)
+
+    # Final save
+    np.save(checkpoint_path, cophenetic_dist_np)
+    print(f"✅ Completed. Saved matrix to {checkpoint_path}")
 
     return cophenetic_dist_np
 
