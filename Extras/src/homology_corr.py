@@ -70,7 +70,7 @@ def hm_correlation_analysis(fasta_aln_file,model_type,shuffle,colattn):
     else:
         layers = [model_layer_plm_repr[model_type]]
         print(f"Getting pLM representation for protein family {base_file_name} from model {utils_get_embeddings.full_model_name[model_type]}")
-        PLM_dataset = utils_get_embeddings.get_plm_representation(model_type,fasta_file_wo_gap,fasta_file_std_gap,layers)
+        PLM_dataset = utils_get_embeddings.get_plm_representation(model_type,fasta_file_wo_gap,fasta_file_std_gap,'all')
         print(f"pLM embedding created for {len(PLM_dataset[:][0])} sequences each of size {PLM_dataset[0][1].shape}")
         rho_layer_corr,pearson_layer_corr = layer_wise_lg_corr(PLM_dataset,lg_mat_np,seq_ref_dict)
     # df_final = local_sim_analysis(fasta_aln_file, model_type, 20, PLM_dataset)
