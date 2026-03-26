@@ -1,0 +1,29 @@
+# EvoCluster documented Python requirements
+#
+# Core Phase 2 multiscale pipeline
+numpy
+scipy
+scikit-learn
+torch
+fair-esm
+python-igraph
+leidenalg
+faiss-cpu
+
+# Common utilities used across the repo
+pandas
+tqdm
+matplotlib
+biopython
+umap-learn
+ete3
+
+# Notes:
+# - GPU acceleration in the docs uses CUDA-enabled PyTorch/FAISS, which is
+#   environment-specific and usually installed separately from this file.
+# - FastTree and Clustal Omega are external tools mentioned in the docs, not
+#   Python packages, so they are intentionally not listed here.
+# - Multiscale PHATE is documented as optional for --use_phate. Its current
+#   GitHub package can fail during build on Windows, so it is intentionally not
+#   included in this base requirements file.
+#   Upstream repo: https://github.com/KrishnaswamyLab/Multiscale_PHATE
