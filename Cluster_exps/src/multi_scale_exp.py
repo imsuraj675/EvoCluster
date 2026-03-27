@@ -6,10 +6,10 @@ import logging
 
 from pipeline.io import setup_logging, log_device_info, load_embeddings, prepare_embeddings, save_results
 from pipeline.graph import compute_adaptive_k, build_candidate_neighbors, build_snn_graph, run_phate_scale_discovery, map_phate_to_leiden_resolutions
-from pipeline.leiden import run_leiden_multiscale, build_cluster_hierarchy
+from pipeline.leiden import run_leiden_multiscale, build_cluster_hierarchy, DEFAULT_RESOLUTIONS
 from pipeline.selection import score_and_select_scales
 from pipeline.merge import refine_and_flatten
-from pipeline.evaluation import get_total_counts, evaluate_clustering
+from pipeline.evaluation import get_ground_truth_stats, evaluate_clustering
 
 def run_pipeline(
     *,
@@ -50,25 +50,27 @@ def run_pipeline(
     log.info(f"  PHATE scale discovery: {use_phate}")
     log.info(f"  Resolutions: {resolution_grid or ('PHATE-derived' if use_phate else 'Default')}")
     log.info(f"  Merge: cos>={centroid_cos_threshold}, edge>={edge_connectivity_threshold}")
-    log.info(f"  Output level: {output_level}, alpha={alpha}")
+    log.info(f"  Output level: {output_level}")
     log.info("=" * 60)
+    if alpha != 0.5:
+        log.warning("  --alpha is deprecated and has no effect on the pairwise evaluator.")
+    if min_cluster_size != 1:
+        log.warning("  --min_cluster_size is currently not enforced in Leiden outputs and is recorded for traceability only.")
 
     # Step 1: Load + prepare
     t0 = time.time()
     X_by_layer, prot_meta = load_embeddings(fasta_path, emb_path, [layer], logger=log)
     X_raw = X_by_layer[layer]
-    total_n2m, total_121 = get_total_counts(prot_meta)
-    log.info(f"  True n:m pairs: {total_n2m}, True 1:1 groups: {total_121}")
+    gt_stats = get_ground_truth_stats(prot_meta)
+    log.info(
+        f"  Ground truth: {gt_stats['n_orthogroups']} orthogroups, "
+        f"{gt_stats['true_positive_pairs']} same-orthogroup protein pairs"
+    )
 
     prep = prepare_embeddings(X_raw, pca_dim=pca_dim, logger=log)
     X = prep["X"]
+    X_pca = prep["X_pca"]
     N = prep["N"]
-    # Keep unscaled PCA for evaluation (centroid distances)
-    if pca_dim > 0 and pca_dim < X_raw.shape[1]:
-        from sklearn.decomposition import PCA
-        X_pca = PCA(n_components=pca_dim, svd_solver="full").fit_transform(X_raw)
-    else:
-        X_pca = X_raw.copy()
     log.info(f"  Step 1 took {time.time() - t0:.1f}s")
 
     # Step 2: SNN graph
@@ -100,7 +102,7 @@ def run_pipeline(
         if len(ms_result["levels"]) < 3:
             log.warning("  ⚠ PyGen returned < 3 feasible scales. Falling back to default Leiden multiscale grid.")
             if resolution_grid is None:
-                resolution_grid = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7]
+                resolution_grid = DEFAULT_RESOLUTIONS
             ms_result = run_leiden_multiscale(
                 snn,
                 resolution_grid=resolution_grid,
@@ -175,8 +177,11 @@ def run_pipeline(
     all_metrics = {}
     for level_name, level_labels in refined["labels_all"].items():
         all_metrics[level_name] = evaluate_clustering(
-            level_labels, prot_meta, X_pca, total_n2m, total_121,
-            graph=snn.get("graph"), alpha=alpha, level_name=level_name, logger=log,
+            level_labels,
+            prot_meta,
+            graph=snn.get("graph"),
+            level_name=level_name,
+            logger=log,
         )
     log.info(f"  Step 6 took {time.time() - t0:.1f}s")
 
@@ -200,7 +205,7 @@ def run_pipeline(
         "centroid_cos_threshold": centroid_cos_threshold,
         "edge_connectivity_threshold": edge_connectivity_threshold,
         "output_level": output_level,
-        "alpha": alpha,
+        "alpha_deprecated": alpha,
         "seed": seed,
         "min_cluster_size": min_cluster_size,
         "discovery_mode": mode,
@@ -222,6 +227,7 @@ def run_pipeline(
         "graph_stats": snn["stats"],
         "merge_log": refined["merge_log"],
         "n_merges": refined["n_merges"],
+        "stage_summaries": refined.get("stage_summaries", []),
         "config": config,
         "prot_meta": prot_meta,
     }
@@ -238,13 +244,13 @@ def parse_args():
     parser.add_argument("--k_cap", type=int, default=150, help="Max k (default: 150)")
     parser.add_argument("--k_override", type=int, default=None, help="Override adaptive k with fixed value")
     parser.add_argument("--prune_method", type=str, default="inverse_k", choices=["inverse_k", "percentile"], help="SNN pruning method")
-    parser.add_argument("--resolutions", type=str, default=None, help="Comma-separated CPM resolutions (default: 0.05,0.1,0.2,0.3,0.5,0.7)")
+    parser.add_argument("--resolutions", type=str, default=None, help="Comma-separated CPM resolutions (default: 0.01,0.02,0.04,0.06,0.08,0.10,0.15,0.20,0.30,0.45,0.60,0.80,1.00)")
     parser.add_argument("--objective", type=str, default="CPM", choices=["CPM", "modularity"], help="Leiden objective")
-    parser.add_argument("--min_cluster_size", type=int, default=1, help="Min cluster size (default: 1)")
+    parser.add_argument("--min_cluster_size", type=int, default=1, help="Recorded for traceability; currently not enforced in Leiden outputs (default: 1)")
     parser.add_argument("--centroid_cos_threshold", type=float, default=0.85, help="Centroid cosine merge threshold (default: 0.85)")
     parser.add_argument("--edge_connectivity_threshold", type=float, default=0.05, help="SNN edge connectivity merge threshold (default: 0.05)")
     parser.add_argument("--output_level", type=str, default="fine", choices=["coarse", "fine", "adaptive"], help="Primary output level")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Combined score weight: alpha*dist_F1 + (1-alpha)*121_F1")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Deprecated: retained for CLI compatibility, no effect on the pairwise evaluator")
     parser.add_argument("--use_phate", action="store_true", help="Use Multiscale PHATE for automatic scale discovery")
     parser.add_argument("--no_pygen", action="store_true", help="Disable default PyGenStability and use manual heuristic grid")
     parser.add_argument("--use_profile", action="store_true", help="Use leidenalg.resolution_profile for scale discovery")

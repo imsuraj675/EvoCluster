@@ -2,6 +2,10 @@ import logging
 import numpy as np
 from sklearn.metrics import normalized_mutual_info_score
 
+TARGET_CLUSTER_RATIO = 1.0 / 3.0
+MAX_SELECTED_LEVELS = 6
+K_SPACING_FRACTION = 0.10
+
 def _is_feasible(n_clusters, n_singletons, N, logger=None):
     """Check if a Leiden level is feasible (not pathological)."""
     avg_size = N / max(n_clusters, 1)
@@ -31,7 +35,6 @@ def _compute_mean_conductance(labels, g, cluster_ids):
         if n_members < 1:
             continue
 
-        member_set = set(members.tolist())
         subgraph = g.subgraph(members.tolist())
         internal_edges = subgraph.ecount()
         vol_c = sum(g.degree(m) for m in members.tolist())
@@ -97,15 +100,20 @@ def score_and_select_scales(
     objective_function="CPM",
     logger=None,
 ):
-    """Score stability across levels and select >=4 levels."""
+    """Score levels and select a target-aware coarse-to-fine subset."""
     log = logger or logging.getLogger("multiscale")
+    if selection_policy != "best_composite":
+        log.warning(
+            f"Selection policy '{selection_policy}' currently aliases to the composite scorer; "
+            "specialized policy branches are not implemented."
+        )
     levels = multiscale_result["levels"]
     n_levels = len(levels)
     g = snn_graph_result["graph"]
     N = snn_graph_result["n_nodes"]
 
     log.info(f"Step 4: Scoring stability across {n_levels} levels (policy={selection_policy})")
-    target_K = max(N / 4, 10)
+    target_K = max(N * TARGET_CLUSTER_RATIO, 10.0)
     target_avg_size = N / target_K
     singleton_tolerance = 0.10
 
@@ -155,7 +163,6 @@ def score_and_select_scales(
 
         avg_cluster_size = N / max(n_clusters, 1)
         size_reg = min(avg_cluster_size / target_avg_size, 1.0)
-        singleton_ratio = n_singletons / max(N, 1)
         n_size1_clusters = sum(1 for cid in cluster_ids if np.sum(labels == cid) == 1)
         effective_singleton_ratio = (n_singletons + n_size1_clusters) / max(N, 1)
         frag_penalty = max(0.0, effective_singleton_ratio - singleton_tolerance)
@@ -229,57 +236,101 @@ def score_and_select_scales(
             if plateau_scores[idx] > 0:
                 log.debug(f"  Plateau bonus +{bonus:.3f} for res={levels[feas_idx]['resolution']:.4f}")
 
-    if len(feasible_indices) <= 4:
+    if len(feasible_indices) <= MAX_SELECTED_LEVELS:
         selected = list(feasible_indices)
+        if feasible_indices:
+            log.info(
+                f"  Retaining all {len(feasible_indices)} feasible level(s) "
+                f"(<= selection cap {MAX_SELECTED_LEVELS})."
+            )
     else:
         bands = [
-            ("ultra_coarse", lambda K: K < N / 10),
-            ("coarse",       lambda K: N / 10 <= K < N / 4),
-            ("mid",          lambda K: N / 4  <= K < N / 2),
-            ("fine",         lambda K: N / 2  <= K < 0.8 * N),
+            ("macro",        lambda K: K < N / 20),
+            ("ultra_coarse", lambda K: N / 20 <= K < N / 10),
+            ("coarse",       lambda K: N / 10 <= K < N / 6),
+            ("mid_coarse",   lambda K: N / 6  <= K < N / 4),
+            ("target",       lambda K: N / 4  <= K < N / 2),
+            ("fine",         lambda K: N / 2  <= K < 0.7 * N),
         ]
         selected = []
-        used_bands = []
-        
-        # TASK C.1: Force base recall by asserting the absolute finest scale is always selected
-        finest_idx = max(feasible_indices, key=lambda i: levels[i]["n_clusters"])
-        selected.append(finest_idx)
-        used_bands.append("forced_finest")
+        selection_trace = []
+
+        target_idx = min(
+            feasible_indices,
+            key=lambda i: (
+                abs(levels[i]["n_clusters"] - target_K),
+                -composites[i],
+            ),
+        )
+        selected.append(target_idx)
+        selection_trace.append(
+            (
+                "target_anchor",
+                levels[target_idx]["resolution"],
+                levels[target_idx]["n_clusters"],
+            )
+        )
+        log.info(
+            f"  Target-aware anchor: target_K≈{target_K:.0f}, "
+            f"selected res={levels[target_idx]['resolution']:.4f} "
+            f"(K={levels[target_idx]['n_clusters']})"
+        )
         
         for band_name, band_filter in bands:
             candidates = [i for i in feasible_indices if band_filter(levels[i]["n_clusters"]) and i not in selected]
             if candidates:
                 best = max(candidates, key=lambda i: composites[i])
                 selected.append(best)
-                used_bands.append(band_name)
+                selection_trace.append(
+                    (
+                        band_name,
+                        levels[best]["resolution"],
+                        levels[best]["n_clusters"],
+                    )
+                )
                 
-        # TASK C.2: Fill remaining slots enforcing explicitly wide K-spacing
         remaining = sorted([i for i in feasible_indices if i not in selected], key=lambda i: composites[i], reverse=True)
         
-        while len(selected) < 4 and remaining:
+        while len(selected) < MAX_SELECTED_LEVELS and remaining:
             cand_idx = remaining.pop(0)
             cand_k = levels[cand_idx]["n_clusters"]
             
-            # Check K-spacing against all selected so far
             is_diverse = True
             for sel_idx in selected:
                 sel_k = levels[sel_idx]["n_clusters"]
-                if abs(cand_k - sel_k) / max(sel_k, 1) < 0.15:
+                if abs(cand_k - sel_k) / max(sel_k, 1) < K_SPACING_FRACTION:
                     is_diverse = False
                     break
                     
             if is_diverse:
                 selected.append(cand_idx)
+                selection_trace.append(
+                    (
+                        "diversity_fill",
+                        levels[cand_idx]["resolution"],
+                        levels[cand_idx]["n_clusters"],
+                    )
+                )
                 
-        # TASK A: Ensure explicit monotonic K progression (coarse to fine)
         selected = sorted(set(selected), key=lambda i: levels[i]["n_clusters"])
-        log.info(f"  Band selection: {list(zip(used_bands, [levels[s]['n_clusters'] for s in selected[:len(used_bands)]]))}")
+        log.info(
+            "  Target-aware selection trace: "
+            + str(
+                [
+                    {
+                        "source": source,
+                        "resolution": round(resolution, 4),
+                        "K": n_clusters,
+                    }
+                    for source, resolution, n_clusters in selection_trace
+                ]
+            )
+        )
     
     selected = sorted(set(selected), key=lambda i: levels[i]["n_clusters"])
     if not selected:
         log.warning("  ⚠ No feasible levels found! Falling back to all levels.")
         selected = list(range(n_levels))
-    res_values = [per_level_scores[i]["resolution"] for i in selected]
     k_values = [per_level_scores[i]["n_clusters"] for i in selected]
     log.info(f"  ▸ Selected {len(selected)} level(s): {selected} (K: {k_values})")
     return {

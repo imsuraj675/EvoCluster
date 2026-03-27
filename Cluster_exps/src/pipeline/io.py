@@ -10,6 +10,7 @@ import torch
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import esm
+from .plots import save_diagnostic_plots
 
 EPS = 1e-12
 
@@ -90,6 +91,7 @@ def prepare_embeddings(X_raw, *, pca_dim=400, scale=True, normalize=True, logger
     else:
         pca_model = None
         X = X_raw.copy()
+    X_pca = X.copy()
     scaler = None
     if scale:
         scaler = StandardScaler()
@@ -97,7 +99,7 @@ def prepare_embeddings(X_raw, *, pca_dim=400, scale=True, normalize=True, logger
     if normalize:
         X = l2_normalize(X)
     log.info(f"  Output shape: {X.shape}")
-    return {"X": X, "pca_model": pca_model, "scaler": scaler, "N": X.shape[0]}
+    return {"X": X, "X_pca": X_pca, "pca_model": pca_model, "scaler": scaler, "N": X.shape[0]}
 
 def save_results(results, results_path, organism, logger=None):
     log = logger or logging.getLogger("multiscale")
@@ -110,6 +112,7 @@ def save_results(results, results_path, organism, logger=None):
         "stability": results["stability"],
         "n_merges": results["n_merges"],
         "merge_log": results["merge_log"],
+        "stage_summaries": results.get("stage_summaries", []),
         "labels": results["labels"],
         "labels_all": {k: v.tolist() for k, v in results["labels_all"].items()},
     }
@@ -119,20 +122,20 @@ def save_results(results, results_path, organism, logger=None):
     tsv_path = os.path.join(results_path, f"{organism}_multiscale_summary.tsv")
     headers = [
         "level", "n_clusters", "n_singletons",
-        "naive_P", "naive_R", "naive_F1",
-        "dist_P", "dist_R", "dist_F1",
-        "121_P", "121_R", "121_F1",
-        "AMI", "combined",
+        "pairwise_P", "pairwise_R", "pairwise_F1",
+        "TP", "FP", "FN", "TN",
+        "AMI", "score",
     ]
     with open(tsv_path, "w") as f:
         f.write("\t".join(headers) + "\n")
         for level_name, m in results["metrics"].items():
+            pairwise = m["pairwise"]
             row = [
                 level_name, str(m["n_clusters"]), str(m["n_singletons"]),
-                f"{m['naive'][0]:.4f}", f"{m['naive'][1]:.4f}", f"{m['naive'][2]:.4f}",
-                f"{m['distance'][0]:.4f}", f"{m['distance'][1]:.4f}", f"{m['distance'][2]:.4f}",
-                f"{m['121'][0]:.4f}", f"{m['121'][1]:.4f}", f"{m['121'][2]:.4f}",
-                f"{m['AMI']:.4f}", f"{m['combined_score']:.4f}",
+                f"{pairwise['precision']:.4f}", f"{pairwise['recall']:.4f}", f"{pairwise['f1']:.4f}",
+                str(pairwise["TP"]), str(pairwise["FP"]), str(pairwise["FN"]), str(pairwise["TN"]),
+                f"{m['AMI']:.4f}", f"{m['primary_score']:.4f}",
             ]
             f.write("\t".join(row) + "\n")
     log.info(f"Saved summary to: {tsv_path}")
+    save_diagnostic_plots(results, results_path, organism, logger=log)

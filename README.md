@@ -88,11 +88,11 @@ graph TD
     F2 --> G
     F3 --> G
     
-    G -->|Plateau Detection + Band Selection| H(>=4 Selected Hierarchical Scales)
+    G -->|Plateau Detection + Target-Aware Band Selection| H(Up to 6 Selected Hierarchical Scales)
     H -->|Cascaded Branch-Local Merge| I(Refinement + Normalization)
     I --> J{Outputs}
     
-    J -->|Evaluation| K1[Biological Metrics: n:m, 1:1, AMI]
+    J -->|Evaluation| K1[Pairwise P/R/F1 + AMI]
     J -->|Validation| K2[CDlib Topological Metrics]
     J -->|Labels| K3[Coarse / Mid / Fine / Adaptive]
 ```
@@ -120,8 +120,8 @@ Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 ### Stage 2: SNN Graph Construction
 
 #### 2a. Adaptive k Computation
-- **Formula**: `k = min(ceil(0.4 × √N), 150)`
-- Examples: N=40k → k=80, N=50k → k=90, N=60k → k=98
+- **Formula**: `k = min(ceil(0.6 × √N), 150)`
+- Examples: N=40k → k=120, N=50k → k=134, N=60k → k=147
 
 #### 2b. Candidate Neighbor Search
 - **FAISS HNSW** for fast approximate kNN (with sklearn fallback)
@@ -135,9 +135,9 @@ Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 ### Stage 3: Architecture Discovery + Hierarchy
 
 #### 3a. Multiscale Resolution Sweep
-- **PyGenStability (Default)**: Discovers true graph topological structural scales via continuous-time Markov stability sweeps, automatically mapping candidate partitions without manual intervention.
-- **Resolution Profile** (`--use_profile`): Extracts Leiden plateau stability states iteratively.
-- **Manual Grid** (`--no_pygen`): Runs predefined Leiden CPM at resolutions e.g., `[0.01, ..., 0.30]`.
+- **PyGenStability (Default)**: Runs a bounded Markov-stability sweep first and keeps only feasible distinct candidate partitions.
+- **Resolution Profile** (`--use_profile`): Extracts Leiden plateau stability states with bounded resolution range and post-thinning by K-spacing.
+- **Manual Grid** (`--no_pygen`): Runs predefined Leiden CPM resolutions `[0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30, 0.45, 0.60, 0.80, 1.00]`.
 - Returns label matrix (N × n_resolutions)
 
 #### 3b. Hierarchy Construction
@@ -147,34 +147,36 @@ Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 
 ### Stage 4: Stability + Scale Selection
 
-**Metrics computed per level**:
+**Metrics computed per level** (6-factor composite):
 1. NMI between adjacent resolution levels
-2. Cluster count ratio (K_r / K_{r-1})
-3. Mean intra-cluster edge density: `actual_edges(c) / possible_edges(c)`
-4. Composite = `0.5 × NMI + 0.5 × edge_density`
+2. **Cohesion**: Weighted intra-cluster edge density
+3. **Separation**: 1 − mean conductance
+4. **Size Regularizer**: Penalizes extreme fragmentation
+5. **Fragmentation Penalty**: Penalizes high singleton ratios
+6. **Consensus Stability**: Mean pairwise NMI across multiple Leiden seeds
 
-**Selection policies**: `best_composite` (default), `max_stability`, `best_density`, `elbow`
+**Selection mechanism**: Retains a coarse-to-fine subset with target-aware anchoring near a biologically plausible K region (roughly `N/3` when enough feasible levels exist), band-aware diversity, and K-monotonic ordering. The active implemented policy is `best_composite`.
 
 ### Stage 5: Branch-Local Refinement
 
 **No global O(K²) merging.** Only siblings under the same coarse parent are candidates.
 
-**Hybrid merge criterion** — BOTH must pass:
-1. Centroid cosine similarity ≥ `0.85`
-2. SNN edge connectivity ≥ `0.05`: `|edges(A,B)| / (|A| × |B|)`
+**Hybrid merge criterion**:
+1. Strong graph evidence alone can trigger a merge
+2. Otherwise both centroid cosine similarity and SNN edge connectivity must pass
 
-**Multi-level output**: Returns coarse, fine, and adaptive (per-branch best) labels.
+**Graph-aware normalization**:
+`edge_conn = n_cross / (min(|A|, |B|) × k)`
+
+**Multi-level output**: Returns coarse, mid, fine, and adaptive labels.
 
 ### Stage 6: Evaluation
 
 | Metric Type | Description |
 |---|---|
-| **Naive n:m** | All inter-species pairs in the same cluster |
-| **Distance n:m** | Closest cross-species pair per cluster (by cosine distance) |
-| **1:1 orthogroups** | Clusters with exactly one protein per species |
+| **Pairwise Precision / Recall / F1** | Protein-pair agreement between predicted clusters and true orthogroups |
 | **AMI** | Adjusted Mutual Information vs true orthogroup assignments |
-| **Topological** | (CDlib) Modularity, Conductance, Coverage (diagnostic only) |
-| **Combined** | `α × dist_F1 + (1-α) × 121_F1` (α default = 0.5) |
+| **Topological** | (CDlib) Modularity, Conductance, Density, Internal Density, Node Coverage (diagnostic only) |
 
 ---
 
@@ -204,27 +206,27 @@ Each organism folder contains:
 | k cap | 150 |
 | SNN metric | Jaccard Similarity |
 | SNN prune method | `inverse_k` (threshold = 1/k) |
-| Edge connectivity norm | `min(|A|,|B|)` |
+| Edge connectivity norm | `n_cross / (min(|A|,|B|) × k)` |
 | Merge criterion | Hybrid OR (strong edge alone OR centroid+edge) |
 | Merge scoring | `0.7 × edge_conn + 0.3 × cos_sim` |
-| Stability composite | `0.4×NMI + 0.4×density + 0.2×(1-drift)` |
-| Leiden resolutions | `[0.05, 0.1, 0.2, 0.3, 0.5, 0.7]` (or PHATE-derived) |
+| Stability composite | 6-factor composite `(NMI, Cohesion, Separation, Size, Consensus, -Frag)` |
+| Discovery mode | PyGenStability (default; bounded, with fallback to manual grid when too few feasible levels are found) |
 | Objective function | CPM |
-| Centroid merge threshold | 0.85 (cosine) |
-| Edge connectivity threshold | 0.05 (weak), 0.10 (strong) |
+| Centroid merge threshold | 0.85 (cosine, with quadratic escalation per stage) |
+| Edge connectivity threshold | 0.05 (base, with quadratic escalation per stage) |
 | Giant component gate | ≥ 95% |
-| Output level | `adaptive` (per-branch best density) |
-| Combined score weight (α) | 0.5 |
+| Output level | `fine` |
+| Evaluation primary score | Pairwise F1 |
 | PHATE scale discovery | Off (opt-in via `--use_phate`) |
 
 ### Tuning Priority (in order of impact)
 
 1. `--k_coeff` — Neighborhood coefficient (0.3–0.8). Higher = denser SNN graph, more merge opportunities
-2. `--resolutions` — CPM resolution grid (must be < 1.0 for CPM). Lower = larger clusters
+2. `--resolutions` — Manual resolution grid. Lower values usually mean larger clusters
 3. `--use_phate` — Automatic scale discovery (replaces manual --resolutions)
 4. `--centroid_cos_threshold` — Merge criterion Path B (0.75–0.95). Lower = more merging
 5. `--edge_connectivity_threshold` — Edge min(A,B) threshold (0.01–0.20). Lower = easier merge
-6. `--alpha` — Evaluation weight between distance F1 and 1:1 F1
+6. `--selection_policy` — currently only `best_composite` is meaningfully implemented; other CLI values alias the same scorer with a warning
 
 ---
 
@@ -233,7 +235,7 @@ Each organism folder contains:
 ### Basic Run
 
 ```bash
-cd extras
+cd Cluster_exps/src
 python multi_scale_exp.py pfal_pber
 ```
 
@@ -276,7 +278,7 @@ Graph:
 Leiden:
   --resolutions       Comma-separated CPM resolutions
   --objective         CPM | modularity
-  --min_cluster_size  Min cluster size (default: 1)
+  --min_cluster_size  Recorded for traceability; currently not enforced in Leiden outputs
 
 Refinement:
   --centroid_cos_threshold       Cosine merge threshold (default: 0.85)
@@ -284,7 +286,7 @@ Refinement:
   --output_level                 coarse | fine | adaptive
 
 Evaluation:
-  --alpha             Combined score weight (default: 0.5)
+  --alpha             Deprecated; retained for CLI compatibility, no effect on pairwise evaluation
 
 Scale Discovery:
   --use_phate         Enable PHATE automatic scale discovery
@@ -315,16 +317,17 @@ MajorProject/
 │   ├── get_consensus.py                   # Consensus sequence generation
 │   ├── merge_trees.py                     # Unified tree construction
 │   └── prep_data.py / run_prep.py         # Data preparation
-├── extras/                                # Phase 2 + reference materials
-│   ├── pipeline/                          # ★ Modular pipeline package (io, graph, leiden, merge, etc.)
-│   ├── multi_scale_exp.py                 # Thin CLI entrypoint for the pipeline
-│   ├── cluster_lib.py                     # Legacy clustering library
-│   ├── evocluster_tune.py                 # Legacy experiment driver
-│   ├── pseudo.py                          # Legacy pipeline blueprint
+├── Cluster_exps/
+│   └── src/
+│       ├── multi_scale_exp.py             # Active CLI entrypoint
+│       ├── debug_pipeline_validation.py   # Synthetic/component validation suite
+│       └── pipeline/                      # ★ Active modular pipeline package
+├── extras/                                # Docs + reference materials + legacy helpers
 │   ├── context.md                         # Full project context document
 │   ├── pipeline.md                        # Current pipeline design doc
+│   ├── multi_scale_exp_usage.md           # Practical usage guide
+│   ├── next_step.md                       # Current roadmap and status
 │   ├── pipeline_old.md                    # Earlier pipeline design
-│   ├── kmeans.py                          # K-means baseline script
 │   └── run_all.py                         # Batch runner
 ├── Model_Cluster_Results/                 # Per-method clustering results
 │   └── {method}/{organism}/
@@ -344,7 +347,7 @@ MajorProject/
 | Broken hierarchy | Hard overlap threshold | Argmax overlap (no threshold) |
 | Misleading stability | NMI only | NMI + intra-cluster edge density |
 | Sparse graph | No quality check | Giant component ≥ 95% gate |
-| Single output | One flat clustering | Coarse / Fine / Adaptive |
+| Single output | One flat clustering | Coarse / Mid / Fine / Adaptive |
 | Manual resolution grid | Trial-and-error | PHATE auto-discovery (opt-in) |
 
 ---
@@ -361,4 +364,4 @@ MajorProject/
 
 ---
 
-*Last updated: 2026-03-24*
+*Last updated: 2026-03-28*

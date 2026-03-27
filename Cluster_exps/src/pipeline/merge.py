@@ -53,6 +53,7 @@ def refine_and_flatten(
             "n_singletons": N,
             "merge_log": [],
             "n_merges": 0,
+            "stage_summaries": [],
         }
         
     if n_stages < 1:
@@ -66,6 +67,7 @@ def refine_and_flatten(
             "n_singletons": int(np.sum(single_out == -1)),
             "merge_log": [],
             "n_merges": 0,
+            "stage_summaries": [],
         }
 
     stage_thresholds = []
@@ -88,6 +90,7 @@ def refine_and_flatten(
     total_rejected = 0
     all_merge_log = []
     merged_labels = {}
+    stage_summaries = []
 
     for s_idx in range(n_stages):
         guide_idx = selected[s_idx]
@@ -125,6 +128,19 @@ def refine_and_flatten(
 
         result_K = len(set(stage_result["merged_labels"][stage_result["merged_labels"] >= 0].tolist()))
         log.info(f"    → Merges: {stage_result['n_merges']} (rejected: {stage_result['n_rejected']}) → K={result_K}")
+        stage_summaries.append({
+            "stage": s_idx + 1,
+            "guide_level_idx": guide_idx,
+            "fine_level_idx": fine_idx,
+            "guide_k": guide_K,
+            "fine_k_before": fine_K,
+            "fine_k_after": result_K,
+            "n_merges": stage_result["n_merges"],
+            "n_rejected": stage_result["n_rejected"],
+            "cos_threshold": thresholds["cos"],
+            "edge_threshold": thresholds["edge"],
+            "strong_threshold": thresholds["strong"],
+        })
 
     coarse_level_idx = selected[0]
     if coarse_level_idx in merged_labels:
@@ -210,6 +226,7 @@ def refine_and_flatten(
         "n_singletons": int(np.sum(primary == -1)),
         "merge_log": all_merge_log,
         "n_merges": total_merges,
+        "stage_summaries": stage_summaries,
     }
 
 def _cascade_merge_stage(

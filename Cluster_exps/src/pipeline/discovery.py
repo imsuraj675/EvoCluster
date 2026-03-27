@@ -3,6 +3,22 @@ import numpy as np
 from collections import Counter
 from .evaluation import relabel_contiguous
 
+PYGEN_SWEEP_KWARGS = {
+    # Keep PyGen focused on a smaller, biologically useful span and avoid
+    # expensive outputs that this pipeline does not consume.
+    "min_scale": -3.0,
+    "max_scale": -0.5,
+    "n_scale": 12,
+    "n_tries": 10,
+    "with_NVI": False,
+    "with_ttprime": False,
+    "with_optimal_scales": False,
+    "tqdm_disable": True,
+}
+
+PROFILE_RESOLUTION_RANGE = (0.01, 1.0)
+PROFILE_MIN_DIFF_RESOLUTION = 0.05
+
 def run_pygenstability_discovery(snn_graph_result, logger=None):
     """Run PyGenStability to find robust topological partitions as candidate scales."""
     log = logger or logging.getLogger("multiscale")
@@ -13,6 +29,13 @@ def run_pygenstability_discovery(snn_graph_result, logger=None):
         raise
     
     log.info("Step 3 (PyGenStability): Discovering candidate stable regions via Markov Time sweeps...")
+    log.info(
+        "  PyGen sweep config: "
+        f"min_scale={PYGEN_SWEEP_KWARGS['min_scale']}, "
+        f"max_scale={PYGEN_SWEEP_KWARGS['max_scale']}, "
+        f"n_scale={PYGEN_SWEEP_KWARGS['n_scale']}, "
+        f"n_tries={PYGEN_SWEEP_KWARGS['n_tries']}"
+    )
     
     # Extract the Scipy Sparse Adjacency Matrix
     adj = snn_graph_result["adjacency"].astype(np.float64)
@@ -34,7 +57,7 @@ def run_pygenstability_discovery(snn_graph_result, logger=None):
         adj_sub = adj_sub.multiply(1.0 / row_sums[:, None])
         
         # Run the continuous-time Markov stability sweep
-        results = run(adj_sub)
+        results = run(adj_sub, **PYGEN_SWEEP_KWARGS)
     else:
         mask = np.ones(N, dtype=bool)
         
@@ -44,7 +67,7 @@ def run_pygenstability_discovery(snn_graph_result, logger=None):
         adj = adj.multiply(1.0 / row_sums[:, None])
         
         # Run the continuous-time Markov stability sweep
-        results = run(adj)
+        results = run(adj, **PYGEN_SWEEP_KWARGS)
     
     levels = []
     
@@ -105,7 +128,12 @@ def run_pygenstability_discovery(snn_graph_result, logger=None):
         "levels": levels,
     }
 
-def run_resolution_profile_discovery(snn_graph_result, resolution_range=(0.001, 1.0), objective_function="CPM", logger=None):
+def run_resolution_profile_discovery(
+    snn_graph_result,
+    resolution_range=PROFILE_RESOLUTION_RANGE,
+    objective_function="CPM",
+    logger=None,
+):
     """Run leidenalg Resolution Profile to find structural graph transitions."""
     log = logger or logging.getLogger("multiscale")
     try:
@@ -125,9 +153,13 @@ def run_resolution_profile_discovery(snn_graph_result, resolution_range=(0.001, 
     log.info(f"Step 3 (Resolution Profile): Scanning discrete graph transitions across resolution span {resolution_range}...")
     
     optimiser = la.Optimiser()
-    profile = optimiser.resolution_profile(g, partition_type, 
-                                           resolution_range=resolution_range, 
-                                           weights=weights)
+    profile = optimiser.resolution_profile(
+        g,
+        partition_type,
+        resolution_range=resolution_range,
+        weights=weights,
+        min_diff_resolution=PROFILE_MIN_DIFF_RESOLUTION,
+    )
                                            
     # 4.2 Missing Sorting Fix
     profile = sorted(profile, key=lambda p: getattr(p, 'resolution_parameter', 0.0))

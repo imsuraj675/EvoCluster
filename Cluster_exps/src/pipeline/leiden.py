@@ -3,6 +3,8 @@ from collections import Counter
 import numpy as np
 import leidenalg as la
 
+DEFAULT_RESOLUTIONS = [0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30, 0.45, 0.60, 0.80, 1.00]
+
 def _leiden_cluster_count(graph, resolution, objective="CPM"):
     weights = graph.es['weight'] if 'weight' in graph.edge_attributes() else None
     
@@ -33,9 +35,10 @@ def run_leiden_multiscale(
 ):
     from .evaluation import relabel_contiguous
     log = logger or logging.getLogger("multiscale")
-    DEFAULT_RESOLUTIONS = [0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30]
     if resolution_grid is None:
         resolution_grid = DEFAULT_RESOLUTIONS
+    if min_cluster_size != 1:
+        log.warning("  min_cluster_size is currently not enforced in run_leiden_multiscale; proceeding with raw Leiden memberships.")
 
     g = snn_graph_result["graph"]
     N = snn_graph_result["n_nodes"]

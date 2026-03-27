@@ -41,31 +41,25 @@ def evaluate_topology_cdlib(graph, labels, logger=None):
             
         # Create CDlib NodeClustering object linking the igraph and community sequence
         clustering = NodeClustering(communities, graph=graph, method_name="EvoCluster")
-        
-        # 1. Modularity (Newman-Girvan)
-        # Difference between edges within communities and random expectations
-        mod = evaluation.newman_girvan_modularity(graph, clustering)
-        metrics["modularity"] = mod.score
-        
-        # 2. Conductance (Average)
-        # Ratio of edges outside the cluster to the edges inside (lower is better structural isolation)
-        cond = evaluation.conductance(graph, clustering)
-        metrics["conductance"] = cond.score
-        
-        # 3. Scaled Density
-        # Internal density scaled by size
-        dens = evaluation.scaled_density(graph, clustering)
-        metrics["density"] = dens.score
-        
-        # 4. Intra-Cluster Density
-        intra = evaluation.internal_edge_density(graph, clustering)
-        metrics["intra_density"] = intra.score
-        
-        # 5. Coverage
-        # Fraction of nodes covered by the communities (this is basically 1.0 minus singleton fraction)
-        cov = evaluation.coverage(graph, clustering)
-        metrics["coverage"] = cov.score
-        
+
+        # Coverage is not exposed as evaluation.coverage in the installed CDlib
+        # version; NodeClustering already computes node_coverage internally.
+        metrics["coverage"] = float(getattr(clustering, "node_coverage", 0.0))
+
+        metric_fns = {
+            "modularity": evaluation.newman_girvan_modularity,
+            "conductance": evaluation.conductance,
+            "density": evaluation.scaled_density,
+            "intra_density": evaluation.internal_edge_density,
+        }
+
+        for metric_name, metric_fn in metric_fns.items():
+            try:
+                result = metric_fn(graph, clustering)
+                metrics[metric_name] = float(result.score)
+            except Exception as metric_error:
+                log.debug(f"CDlib metric '{metric_name}' failed: {metric_error}")
+
     except Exception as e:
         import traceback
         log.debug(f"CDlib topological evaluation failed: {e}")
