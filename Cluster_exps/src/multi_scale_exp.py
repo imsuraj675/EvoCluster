@@ -348,6 +348,8 @@ def main():
 
     organism_name = os.path.splitext(os.path.basename(fasta_path))[0]
     logger = setup_logging(organism_name)
+    import sys as _sys
+    logger.info(f"CMD: {' '.join(_sys.argv)}")
     np.random.seed(args.seed)
 
     results = run_pipeline(
