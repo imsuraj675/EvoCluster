@@ -123,13 +123,17 @@ def _add_rescue_edges(
     n_rescue = len(rescue_edges)
     if n_rescue > 0:
         g.add_edges(rescue_edges)
-        # Extend weights: existing weights stay, new ones get appended
-        current_weights = g.es["weight"]
-        current_weights.extend(rescue_weights)
-        g.es["weight"] = current_weights
+        
+        # g.es["weight"] now includes Nones for the newly added edges
+        all_weights = g.es["weight"]
+        
+        # Overwrite the trailing None values with the rescue weights
+        for idx in range(n_rescue):
+            all_weights[-(n_rescue) + idx] = rescue_weights[idx]
+            
+        g.es["weight"] = all_weights
 
     log.info(f"  Rescue edges: {n_rescue} added (threshold cos>={rescue_cos_threshold:.2f}, floor_w={rescue_weight_floor})")
-
     return n_rescue
 
 

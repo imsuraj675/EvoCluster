@@ -531,7 +531,14 @@ def _cascade_merge_stage(
             )
             merge_source = "homology_rescue"
 
-        score = 0.7 * edge_conn + 0.3 * cos_sim if passes else 0.0
+        if passes:
+            if merge_source == "homology_rescue":
+                # Prioritize rescue paths to execute before local clusters swell in size
+                score = 1.0 + cos_sim 
+            else:
+                score = 0.7 * edge_conn + 0.3 * cos_sim
+        else:
+            score = 0.0
         return passes, score, cos_sim, edge_conn, reason, merge_source
 
     def _merge_clusters(fi, fj):

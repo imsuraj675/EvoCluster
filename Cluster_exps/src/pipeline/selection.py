@@ -373,6 +373,27 @@ def _select_best_composite(feasible_indices, composites, levels, N, target_K,
                 f"(<= selection cap {max_selected_levels})."
             )
         return list(feasible_indices)
+    
+    selected = []
+    selection_trace = []
+
+    # Define the biological bounds where an anchor is mathematically sane
+    plausible_indices = [
+        i for i in feasible_indices 
+        if (N / 15) <= levels[i]["n_clusters"] <= (N / 2)
+    ]
+    
+    if plausible_indices:
+        # Trust the composite score (which now includes the target penalty)
+        target_idx = max(plausible_indices, key=lambda i: composites[i])
+    else:
+        # Extreme fallback
+        target_idx = max(feasible_indices, key=lambda i: composites[i])
+
+    selected.append(target_idx)
+    selection_trace.append(
+        ("target_anchor", levels[target_idx]["resolution"], levels[target_idx]["n_clusters"])
+    )
 
     bands = [
         ("macro",        lambda K: K < N / 20),
@@ -382,8 +403,6 @@ def _select_best_composite(feasible_indices, composites, levels, N, target_K,
         ("target",       lambda K: N / 4  <= K < N / 2),
         ("fine",         lambda K: N / 2  <= K < 0.7 * N),
     ]
-    selected = []
-    selection_trace = []
 
     target_idx = min(
         feasible_indices,
