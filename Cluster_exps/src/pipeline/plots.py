@@ -213,7 +213,88 @@ def save_diagnostic_plots(results, results_path, organism, logger=None):
         plt.close(fig)
         saved_paths.append(path)
 
+    # ── Extended evaluation plots ──
+    # Size-binned F1 bar chart (using "fine" level if available)
+    fine_metrics = metrics.get("fine", {})
+    ext = fine_metrics.get("extended", {})
+    size_bins = ext.get("size_binned", {})
+
+    if size_bins:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            bin_names = list(size_bins.keys())
+            precisions = [size_bins[b].get("precision", 0) for b in bin_names]
+            recalls = [size_bins[b].get("recall", 0) for b in bin_names]
+            f1s = [size_bins[b].get("f1", 0) for b in bin_names]
+            n_prots = [size_bins[b].get("n_proteins", 0) for b in bin_names]
+
+            fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
+            x = np.arange(len(bin_names))
+            w = 0.25
+            ax.bar(x - w, precisions, width=w, color="#4e79a7", label="Precision")
+            ax.bar(x,     recalls,    width=w, color="#59a14f", label="Recall")
+            ax.bar(x + w, f1s,        width=w, color="#e15759", label="F1")
+            ax.set_xticks(x, [f"{b}\n({n})" for b, n in zip(bin_names, n_prots)], fontsize=8)
+            ax.set_ylim(0, 1)
+            ax.set_ylabel("Score")
+            ax.set_title("Size-Binned Evaluation (fine level)")
+            ax.grid(axis="y", alpha=0.25)
+            ax.legend()
+
+            for i, f1_val in enumerate(f1s):
+                ax.text(x[i] + w, f1_val + 0.02, f"{f1_val:.2f}", ha="center", va="bottom", fontsize=7)
+
+            path = os.path.join(plots_dir, f"{organism}_size_binned_f1.png")
+            fig.savefig(path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+            saved_paths.append(path)
+        except Exception:
+            pass
+
+    # Split/merge error summary
+    sm = ext.get("split_merge", {})
+    if sm and sm.get("n_true_groups", 0) > 0:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+
+            # Pie: splits
+            n_split = sm.get("n_split_groups", 0)
+            n_total = sm.get("n_true_groups", 1)
+            axes[0].pie(
+                [n_split, n_total - n_split],
+                labels=[f"Split ({n_split})", f"Intact ({n_total - n_split})"],
+                colors=["#e15759", "#59a14f"],
+                autopct="%1.0f%%", startangle=90,
+            )
+            axes[0].set_title("True Groups: Split vs Intact")
+
+            # Pie: merges
+            n_merge = sm.get("n_merge_clusters", 0)
+            n_pred = sm.get("n_pred_clusters", 1)
+            axes[1].pie(
+                [n_merge, max(n_pred - n_merge, 0)],
+                labels=[f"Impure ({n_merge})", f"Pure ({max(n_pred - n_merge, 0)})"],
+                colors=["#f28e2b", "#4e79a7"],
+                autopct="%1.0f%%", startangle=90,
+            )
+            axes[1].set_title("Pred Clusters: Impure vs Pure")
+
+            path = os.path.join(plots_dir, f"{organism}_split_merge.png")
+            fig.savefig(path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+            saved_paths.append(path)
+        except Exception:
+            pass
+
     for path in saved_paths:
         log.info(f"Saved plot to: {path}")
 
     return saved_paths
+

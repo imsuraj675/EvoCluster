@@ -69,13 +69,82 @@ def build_candidate_neighbors(X, *, k_candidates, use_faiss=True, use_gpu=False,
         "N": N,
     }
 
+def _add_rescue_edges(
+    g,
+    X,
+    candidate_neighbors,
+    existing_edges,
+    *,
+    rescue_cos_threshold=0.92,
+    rescue_weight_floor=0.02,
+    max_rescue_per_node=3,
+    logger=None,
+):
+    """
+    Add low-weight rescue edges for kNN pairs that were pruned from the SNN
+    graph but have very high embedding cosine similarity.
+
+    This recovers twilight-zone homology pairs where SNN (shared-neighbor
+    overlap) is weak but the pLM embedding signal is strong.
+    """
+    log = logger or logging.getLogger("multiscale")
+
+    N = candidate_neighbors["N"]
+    nbr_indices = candidate_neighbors["indices"]
+    nbr_scores = candidate_neighbors["scores"]
+
+    # Compute per-node norms once for cosine similarity
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+
+    rescue_edges = []
+    rescue_weights = []
+
+    for i in range(N):
+        added_for_i = 0
+        for rank, j in enumerate(nbr_indices[i]):
+            if added_for_i >= max_rescue_per_node:
+                break
+            if j <= i:
+                continue
+            edge_key = (min(i, j), max(i, j))
+            if edge_key in existing_edges:
+                continue  # already in the graph
+
+            # Compute cosine similarity from raw embeddings
+            cos_sim = float(
+                np.dot(X[i], X[j]) / (norms[i, 0] * norms[j, 0])
+            )
+            if cos_sim >= rescue_cos_threshold:
+                rescue_edges.append(edge_key)
+                rescue_weights.append(rescue_weight_floor)
+                added_for_i += 1
+
+    n_rescue = len(rescue_edges)
+    if n_rescue > 0:
+        g.add_edges(rescue_edges)
+        # Extend weights: existing weights stay, new ones get appended
+        current_weights = g.es["weight"]
+        current_weights.extend(rescue_weights)
+        g.es["weight"] = current_weights
+
+    log.info(f"  Rescue edges: {n_rescue} added (threshold cos>={rescue_cos_threshold:.2f}, floor_w={rescue_weight_floor})")
+
+    return n_rescue
+
+
 def build_snn_graph(
     candidate_neighbors,
     *,
+    X=None,
     snn_k=None,
     prune_method="inverse_k",
     prune_percentile=30.0,
     min_giant_component_pct=95.0,
+    rescue_edges=True,
+    rescue_cos_threshold=0.92,
+    rescue_weight_floor=0.02,
+    max_rescue_per_node=3,
     logger=None,
 ):
     import igraph as ig
@@ -85,7 +154,7 @@ def build_snn_graph(
     neighbor_sets = candidate_neighbors["neighbor_sets"]
     k_cand = candidate_neighbors["k_candidates"]
     k = snn_k if snn_k is not None else k_cand
-    log.info(f"Step 2b: Building SNN graph — Jaccard, prune={prune_method}, snn_k={k}")
+    log.info(f"Step 2b: Building SNN graph — Jaccard, prune={prune_method}, snn_k={k}, rescue={rescue_edges}")
     if k < k_cand:
         neighbor_sets = [set(nbr_indices[i][:k]) for i in range(N)]
     edge_weights = {}
@@ -128,6 +197,23 @@ def build_snn_graph(
     weight_list = list(pruned.values())
     g = ig.Graph(n=N, edges=edge_list, directed=False)
     g.es["weight"] = weight_list
+
+    # ── Hybrid rescue edge path ──
+    n_rescue = 0
+    if rescue_edges and X is not None:
+        n_rescue = _add_rescue_edges(
+            g, X, candidate_neighbors, set(pruned.keys()),
+            rescue_cos_threshold=rescue_cos_threshold,
+            rescue_weight_floor=rescue_weight_floor,
+            max_rescue_per_node=max_rescue_per_node,
+            logger=log,
+        )
+        # Rebuild edge/weight lists from the (now modified) igraph
+        edge_list = [e.tuple for e in g.es]
+        weight_list = g.es["weight"]
+    elif rescue_edges and X is None:
+        log.warning("  ⚠ rescue_edges=True but X not provided — skipping rescue edge pass.")
+
     components = g.connected_components()
     comp_sizes = sorted([len(c) for c in components], reverse=True)
     giant_pct = 100.0 * comp_sizes[0] / N if N > 0 else 0.0
@@ -142,7 +228,7 @@ def build_snn_graph(
         log.warning(f"  ⚠ VERY DENSE GRAPH: mean degree {mean_degree:.1f} > 200.")
     rows = [e[0] for e in edge_list] + [e[1] for e in edge_list]
     cols = [e[1] for e in edge_list] + [e[0] for e in edge_list]
-    data = weight_list + weight_list
+    data = list(weight_list) + list(weight_list)
     adjacency = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
     return {
         "graph": g,
@@ -156,6 +242,7 @@ def build_snn_graph(
             "edges_before_prune": edges_before_prune,
             "edges_after_prune": edges_after_prune,
             "prune_threshold_used": threshold,
+            "rescue_edges_added": n_rescue,
         },
     }
 

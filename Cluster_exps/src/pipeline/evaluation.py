@@ -114,7 +114,7 @@ def evaluate_run(labels, prot_meta):
     }
 
 
-def evaluate_clustering(labels, prot_meta, *, graph=None, level_name="", logger=None):
+def evaluate_clustering(labels, prot_meta, *, graph=None, level_name="", extended_eval=False, logger=None):
     """Evaluate clustering against true orthogroup labels."""
     log = logger or logging.getLogger("multiscale")
 
@@ -155,8 +155,41 @@ def evaluate_clustering(labels, prot_meta, *, graph=None, level_name="", logger=
     else:
         log.info(f"  AMI={metrics['AMI']:.4f}  PairwiseF1={pairwise['f1']:.4f}")
 
+    # ── Extended evaluation ──
+    if extended_eval:
+        try:
+            from .evaluation_extended import run_extended_evaluation
+            true_labels = extract_true_labels(prot_meta)
+            ext = run_extended_evaluation(true_labels, labels, logger=log)
+            metrics["extended"] = ext
+
+            # Log headline extended metrics
+            bcubed = ext.get("bcubed", {})
+            sm = ext.get("split_merge", {})
+            log.info(
+                f"  B-cubed  P={bcubed.get('bcubed_precision', 0):.3f}  "
+                f"R={bcubed.get('bcubed_recall', 0):.3f}  "
+                f"F1={bcubed.get('bcubed_f1', 0):.3f}"
+            )
+            log.info(
+                f"  Split/Merge: {sm.get('n_split_groups', 0)} groups split, "
+                f"{sm.get('n_merge_clusters', 0)} clusters impure"
+            )
+
+            # Log size-binned summary
+            size_bins = ext.get("size_binned", {})
+            for bin_name, bm in size_bins.items():
+                if bm.get("n_proteins", 0) > 0:
+                    log.info(
+                        f"  [{bin_name}] P={bm['precision']:.3f} R={bm['recall']:.3f} "
+                        f"F1={bm['f1']:.3f} ({bm['n_proteins']} prots, {bm['n_groups']} groups)"
+                    )
+        except Exception as e:
+            log.debug(f"Extended evaluation failed: {e}")
+
     metrics["primary_score"] = pairwise["f1"]
     metrics["combined_score"] = pairwise["f1"]
     metrics["n_clusters"] = n_clusters
     metrics["n_singletons"] = n_singletons
     return metrics
+

@@ -19,6 +19,13 @@ def refine_and_flatten(
     protect_singletons=True,
     output_level="adaptive",
     k_neighbors=None,
+    homology_rescue=False,
+    homology_rescue_cos=0.95,
+    homology_rescue_max_size=20,
+    cross_branch_rescue=False,
+    cross_branch_cos=0.93,
+    cross_branch_edge=0.03,
+    max_cross_branch_merges=500,
     logger=None,
 ):
     from .evaluation import relabel_contiguous
@@ -38,6 +45,8 @@ def refine_and_flatten(
     log.info(f"  Selected levels for cascade: {selected}")
     log.info(f"  Base thresholds — cos: {centroid_cos_threshold}, edge: {edge_connectivity_threshold}, strong: {edge_strong_threshold}")
     log.info(f"  Graph-aware normalization — k={k}")
+    log.info(f"  Homology rescue: {homology_rescue} (cos>={homology_rescue_cos}, max_size<={homology_rescue_max_size})")
+    log.info(f"  Cross-branch rescue: {cross_branch_rescue} (cos>={cross_branch_cos}, edge>={cross_branch_edge}, max={max_cross_branch_merges})")
 
     adj_csr = adjacency.tocsr() if not hasattr(adjacency, 'indptr') else adjacency
 
@@ -73,7 +82,7 @@ def refine_and_flatten(
     stage_thresholds = []
     for s_idx in range(n_stages):
         t_linear = s_idx / max(n_stages - 1, 1) if n_stages > 1 else 0.0
-        # TASK E: Quadratic escalation for modest early-stage loosening
+        # Quadratic escalation for modest early-stage loosening
         t_quad = t_linear ** 2
         
         cos_t  = centroid_cos_threshold    + 0.10 * t_quad
@@ -88,6 +97,7 @@ def refine_and_flatten(
 
     total_merges = 0
     total_rejected = 0
+    total_homology_rescues = 0
     all_merge_log = []
     merged_labels = {}
     stage_summaries = []
@@ -118,16 +128,24 @@ def refine_and_flatten(
             cos_threshold=thresholds["cos"],
             edge_threshold=thresholds["edge"],
             strong_threshold=thresholds["strong"],
+            homology_rescue=homology_rescue,
+            homology_rescue_cos=homology_rescue_cos,
+            homology_rescue_max_size=homology_rescue_max_size,
             logger=log,
         )
 
         merged_labels[fine_idx] = stage_result["merged_labels"]
         total_merges += stage_result["n_merges"]
         total_rejected += stage_result["n_rejected"]
+        total_homology_rescues += stage_result.get("n_homology_rescues", 0)
         all_merge_log.extend(stage_result["merge_log"])
 
         result_K = len(set(stage_result["merged_labels"][stage_result["merged_labels"] >= 0].tolist()))
-        log.info(f"    → Merges: {stage_result['n_merges']} (rejected: {stage_result['n_rejected']}) → K={result_K}")
+        log.info(
+            f"    → Merges: {stage_result['n_merges']} "
+            f"(rejected: {stage_result['n_rejected']}, "
+            f"homology_rescue: {stage_result.get('n_homology_rescues', 0)}) → K={result_K}"
+        )
         stage_summaries.append({
             "stage": s_idx + 1,
             "guide_level_idx": guide_idx,
@@ -137,6 +155,7 @@ def refine_and_flatten(
             "fine_k_after": result_K,
             "n_merges": stage_result["n_merges"],
             "n_rejected": stage_result["n_rejected"],
+            "n_homology_rescues": stage_result.get("n_homology_rescues", 0),
             "cos_threshold": thresholds["cos"],
             "edge_threshold": thresholds["edge"],
             "strong_threshold": thresholds["strong"],
@@ -159,6 +178,27 @@ def refine_and_flatten(
             mid_out, _ = relabel_contiguous(levels[mid_idx]["labels"].copy())
     else:
         mid_out = fine_out.copy()
+
+    # ── Cross-branch rescue pass ──
+    n_cross_branch_merges = 0
+    if cross_branch_rescue:
+        cb_result = _cross_branch_rescue(
+            X=X,
+            fine_labels=fine_out,
+            coarse_labels=coarse_out,
+            adj_csr=adj_csr,
+            k=k,
+            cross_branch_cos=cross_branch_cos,
+            cross_branch_edge=cross_branch_edge,
+            max_merges=max_cross_branch_merges,
+            logger=log,
+        )
+        fine_out = cb_result["labels"]
+        fine_out, _ = relabel_contiguous(fine_out)
+        n_cross_branch_merges = cb_result["n_merges"]
+        total_merges += n_cross_branch_merges
+        all_merge_log.extend(cb_result["merge_log"])
+        log.info(f"  Cross-branch rescue: {n_cross_branch_merges} merges performed")
 
     g = snn_graph_result["graph"]
     adaptive_out = fine_out.copy()
@@ -200,6 +240,8 @@ def refine_and_flatten(
 
     log.info(f"  Total merge candidates evaluated: {total_merges + total_rejected}")
     log.info(f"  Total merges performed: {total_merges} (rejected: {total_rejected})")
+    log.info(f"  Homology rescues: {total_homology_rescues}")
+    log.info(f"  Cross-branch rescues: {n_cross_branch_merges}")
     log.info(f"  Final clusters (fine/merged): {n_clusters_fine} (+{n_singletons} singletons)")
     log.info(f"  Output level: {output_level}")
 
@@ -229,9 +271,163 @@ def refine_and_flatten(
         "stage_summaries": stage_summaries,
     }
 
+
+# ---------------------------------------------------------------------------
+#  Cross-branch rescue
+# ---------------------------------------------------------------------------
+
+def _cross_branch_rescue(
+    X, fine_labels, coarse_labels, adj_csr, k,
+    cross_branch_cos, cross_branch_edge, max_merges, logger=None,
+):
+    """
+    After branch-local cascaded merge, attempt a single global pass that
+    allows merges across coarse-level branch boundaries when both cosine
+    similarity and edge connectivity evidence is strong.
+
+    Only pairs whose coarse parents share a common grandparent (if available)
+    or are direct coarse neighbors are considered.
+    """
+    log = logger or logging.getLogger("multiscale")
+    log.info("  ── Cross-branch rescue pass ──")
+
+    merged = fine_labels.copy()
+    merge_log = []
+    n_merges = 0
+
+    # Build cluster info
+    cluster_info = {}
+    for fid in set(merged[merged >= 0].tolist()):
+        members = np.where(merged == fid)[0]
+        cluster_info[fid] = {
+            "members": set(members.tolist()),
+            "sum": X[members].sum(axis=0),
+            "count": len(members),
+        }
+
+    # Build cross-edge counts and neighbor map
+    node_to_cluster = {}
+    for fid, info in cluster_info.items():
+        for node in info["members"]:
+            node_to_cluster[node] = fid
+
+    cross_edges = defaultdict(int)
+    cluster_neighbors = defaultdict(set)
+
+    for node_i in range(adj_csr.shape[0]):
+        ci = node_to_cluster.get(node_i, -1)
+        if ci < 0:
+            continue
+        row_start = adj_csr.indptr[node_i]
+        row_end = adj_csr.indptr[node_i + 1]
+        for idx in range(row_start, row_end):
+            node_j = adj_csr.indices[idx]
+            cj = node_to_cluster.get(node_j, -1)
+            if cj < 0 or ci == cj:
+                continue
+            key = (min(ci, cj), max(ci, cj))
+            cross_edges[key] += 1
+            cluster_neighbors[ci].add(cj)
+            cluster_neighbors[cj].add(ci)
+
+    for key in cross_edges:
+        cross_edges[key] //= 2
+
+    # Build coarse branch mapping: fine_cluster -> coarse_cluster
+    fine_to_coarse = {}
+    for fid in cluster_info:
+        members = list(cluster_info[fid]["members"])
+        if members:
+            coarse_votes = coarse_labels[members]
+            coarse_votes = coarse_votes[coarse_votes >= 0]
+            if len(coarse_votes) > 0:
+                fine_to_coarse[fid] = int(np.argmax(np.bincount(coarse_votes)))
+
+    # Score all cross-branch pairs
+    candidates = []
+    seen_pairs = set()
+
+    for fi in list(cluster_info.keys()):
+        coarse_fi = fine_to_coarse.get(fi, -1)
+        for fj in cluster_neighbors.get(fi, set()):
+            if fj <= fi:
+                continue
+            pair = (fi, fj)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            coarse_fj = fine_to_coarse.get(fj, -1)
+            # Only consider CROSS-branch pairs
+            if coarse_fi == coarse_fj and coarse_fi >= 0:
+                continue
+
+            # Cosine similarity
+            ci_vec = cluster_info[fi]["sum"] / max(cluster_info[fi]["count"], 1)
+            cj_vec = cluster_info[fj]["sum"] / max(cluster_info[fj]["count"], 1)
+            ni, nj = np.linalg.norm(ci_vec), np.linalg.norm(cj_vec)
+            cos_sim = float(np.dot(ci_vec, cj_vec) / (ni * nj + EPS))
+
+            # Edge connectivity
+            key = (min(fi, fj), max(fi, fj))
+            n_cross = cross_edges.get(key, 0)
+            min_size = min(cluster_info[fi]["count"], cluster_info[fj]["count"])
+            denom = min_size * k if k > 0 else min_size
+            edge_conn = n_cross / denom if denom > 0 else 0.0
+
+            if cos_sim >= cross_branch_cos and edge_conn >= cross_branch_edge:
+                score = 0.7 * edge_conn + 0.3 * cos_sim
+                candidates.append((score, fi, fj, cos_sim, edge_conn))
+
+    # Sort by score descending, merge top candidates
+    candidates.sort(key=lambda x: -x[0])
+    cluster_version = {fid: 0 for fid in cluster_info}
+
+    for score, fi, fj, cos_sim, edge_conn in candidates:
+        if n_merges >= max_merges:
+            break
+        if fi not in cluster_info or fj not in cluster_info:
+            continue
+
+        # Merge fj into fi
+        info_i = cluster_info[fi]
+        info_j = cluster_info.pop(fj)
+
+        info_i["members"].update(info_j["members"])
+        info_i["sum"] = info_i["sum"] + info_j["sum"]
+        info_i["count"] += info_j["count"]
+
+        for node in info_j["members"]:
+            node_to_cluster[node] = fi
+            merged[node] = fi
+
+        merge_log.append({
+            "child_a": int(fi), "child_b": int(fj),
+            "centroid_sim": cos_sim, "edge_connectivity": edge_conn,
+            "merged": True,
+            "reason": f"cross_branch cos={cos_sim:.3f}>={cross_branch_cos}, edge={edge_conn:.3f}>={cross_branch_edge}",
+            "merge_source": "cross_branch",
+        })
+        n_merges += 1
+
+    log.info(f"    Cross-branch candidates: {len(candidates)}, merges: {n_merges}")
+
+    return {
+        "labels": merged,
+        "n_merges": n_merges,
+        "merge_log": merge_log,
+    }
+
+
+# ---------------------------------------------------------------------------
+#  Branch-local cascade merge stage (with homology rescue)
+# ---------------------------------------------------------------------------
+
 def _cascade_merge_stage(
     X, guide_labels, fine_labels, adj_csr, k,
-    cos_threshold, edge_threshold, strong_threshold, logger=None,
+    cos_threshold, edge_threshold, strong_threshold,
+    homology_rescue=False, homology_rescue_cos=0.95, homology_rescue_max_size=20,
+    logger=None,
 ):
     log = logger or logging.getLogger("multiscale")
     N = len(fine_labels)
@@ -239,6 +435,7 @@ def _cascade_merge_stage(
     merge_log = []
     n_merges = 0
     n_rejected = 0
+    n_homology_rescues = 0
 
     cluster_info = {}
     for fid in set(merged[merged >= 0].tolist()):
@@ -310,15 +507,32 @@ def _cascade_merge_stage(
 
         passes = False
         reason = ""
+        merge_source = "branch_local"
+
+        # Path A: strong edge connectivity alone
         if edge_conn >= eff_strong:
             passes = True
             reason = f"strong edge_conn {edge_conn:.3f} >= {eff_strong:.3f}"
+        # Path B: cosine + edge
         elif cos_sim >= eff_cos and edge_conn >= eff_edge:
             passes = True
             reason = f"cos {cos_sim:.3f}>={eff_cos:.3f} & edge {edge_conn:.3f}>={eff_edge:.3f}"
+        # Path C: homology rescue — very high cosine for small clusters
+        elif (
+            homology_rescue
+            and cos_sim >= homology_rescue_cos
+            and cluster_info[fi]["count"] <= homology_rescue_max_size
+            and cluster_info[fj]["count"] <= homology_rescue_max_size
+        ):
+            passes = True
+            reason = (
+                f"homology_rescue cos={cos_sim:.3f}>={homology_rescue_cos:.3f} "
+                f"(sizes {cluster_info[fi]['count']},{cluster_info[fj]['count']})"
+            )
+            merge_source = "homology_rescue"
 
         score = 0.7 * edge_conn + 0.3 * cos_sim if passes else 0.0
-        return passes, score, cos_sim, edge_conn, reason
+        return passes, score, cos_sim, edge_conn, reason, merge_source
 
     def _merge_clusters(fi, fj):
         info_i = cluster_info[fi]
@@ -365,6 +579,7 @@ def _cascade_merge_stage(
 
         scored_pairs = set()
         for fi in fine_ids_in_branch:
+            # Score against graph neighbors within this branch
             for fj in cluster_neighbors.get(fi, set()):
                 if fj not in branch_set or fj <= fi:
                     continue
@@ -373,22 +588,49 @@ def _cascade_merge_stage(
                     continue
                 scored_pairs.add(pair_key)
 
-                passes, score, cos_sim, edge_conn, reason = _score_pair(fi, fj)
+                passes, score, cos_sim, edge_conn, reason, merge_source = _score_pair(fi, fj)
                 if not passes:
                     merge_log.append({
                         "child_a": int(fi), "child_b": int(fj),
                         "centroid_sim": cos_sim, "edge_connectivity": edge_conn,
                         "merged": False, "reason": reason or "below thresholds",
+                        "merge_source": merge_source,
                     })
                     n_rejected += 1
                     continue
 
                 vi = cluster_version.get(fi, 0)
                 vj = cluster_version.get(fj, 0)
-                heapq.heappush(heap, (-score, fi, fj, vi, vj, cos_sim, edge_conn, reason))
+                heapq.heappush(heap, (-score, fi, fj, vi, vj, cos_sim, edge_conn, reason, merge_source))
+
+            # Homology rescue: also check non-neighbor siblings in the branch
+            if homology_rescue:
+                for fj in fine_ids_in_branch:
+                    if fj <= fi or fj not in cluster_info or fi not in cluster_info:
+                        continue
+                    pair_key = (fi, fj)
+                    if pair_key in scored_pairs:
+                        continue
+                    # Only attempt for small clusters
+                    if (cluster_info[fi]["count"] > homology_rescue_max_size
+                            or cluster_info[fj]["count"] > homology_rescue_max_size):
+                        continue
+
+                    cos_sim = _centroid_cos(fi, fj)
+                    if cos_sim >= homology_rescue_cos:
+                        scored_pairs.add(pair_key)
+                        _, edge_conn = _edge_conn(fi, fj)
+                        reason = (
+                            f"homology_rescue cos={cos_sim:.3f}>={homology_rescue_cos:.3f} "
+                            f"(sizes {cluster_info[fi]['count']},{cluster_info[fj]['count']})"
+                        )
+                        score = 0.7 * edge_conn + 0.3 * cos_sim
+                        vi = cluster_version.get(fi, 0)
+                        vj = cluster_version.get(fj, 0)
+                        heapq.heappush(heap, (-score, fi, fj, vi, vj, cos_sim, edge_conn, reason, "homology_rescue"))
 
         while heap:
-            neg_score, fi, fj, vi, vj, cos_sim, edge_conn, reason = heapq.heappop(heap)
+            neg_score, fi, fj, vi, vj, cos_sim, edge_conn, reason, merge_source = heapq.heappop(heap)
 
             if fi not in cluster_info or fj not in cluster_info:
                 continue
@@ -401,21 +643,25 @@ def _cascade_merge_stage(
                 "child_a": int(fi), "child_b": int(fj),
                 "centroid_sim": cos_sim, "edge_connectivity": edge_conn,
                 "merged": True, "reason": reason,
+                "merge_source": merge_source,
             })
             n_merges += 1
+            if merge_source == "homology_rescue":
+                n_homology_rescues += 1
 
             for other in list(cluster_neighbors.get(fi, set())):
                 if other not in branch_set or other not in cluster_info:
                     continue
-                passes2, score2, cos2, edge2, reason2 = _score_pair(fi, other)
+                passes2, score2, cos2, edge2, reason2, source2 = _score_pair(fi, other)
                 if passes2:
                     vi2 = cluster_version.get(fi, 0)
                     vo2 = cluster_version.get(other, 0)
-                    heapq.heappush(heap, (-score2, fi, other, vi2, vo2, cos2, edge2, reason2))
+                    heapq.heappush(heap, (-score2, fi, other, vi2, vo2, cos2, edge2, reason2, source2))
 
     return {
         "merged_labels": merged,
         "n_merges": n_merges,
         "n_rejected": n_rejected,
+        "n_homology_rescues": n_homology_rescues,
         "merge_log": merge_log,
     }

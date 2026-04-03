@@ -35,6 +35,20 @@ def run_pipeline(
     no_pygen=False,
     use_profile=False,
     use_gpu=False,
+    # ── New recall-oriented parameters ──
+    rescue_edges=True,
+    rescue_cos_threshold=0.92,
+    homology_rescue=False,
+    homology_rescue_cos=0.95,
+    cross_branch_rescue=False,
+    cross_branch_cos=0.93,
+    cross_branch_edge=0.03,
+    max_cross_branch_merges=500,
+    target_cluster_ratio=None,
+    max_selected_levels=None,
+    extended_eval=False,
+    per_component_discovery=True,
+    min_component_size=50,
     logger=None,
 ):
     """End-to-end multiscale SNN + Leiden pipeline."""
@@ -50,6 +64,10 @@ def run_pipeline(
     log.info(f"  PHATE scale discovery: {use_phate}")
     log.info(f"  Resolutions: {resolution_grid or ('PHATE-derived' if use_phate else 'Default')}")
     log.info(f"  Merge: cos>={centroid_cos_threshold}, edge>={edge_connectivity_threshold}")
+    log.info(f"  Rescue edges: {rescue_edges} (cos>={rescue_cos_threshold})")
+    log.info(f"  Homology rescue: {homology_rescue} (cos>={homology_rescue_cos})")
+    log.info(f"  Cross-branch rescue: {cross_branch_rescue}")
+    log.info(f"  Extended eval: {extended_eval}")
     log.info(f"  Output level: {output_level}")
     log.info("=" * 60)
     if alpha != 0.5:
@@ -79,7 +97,14 @@ def run_pipeline(
     log.info(f"  Adaptive k = {k} (N={N})")
 
     candidates = build_candidate_neighbors(X, k_candidates=k, use_gpu=use_gpu, logger=log)
-    snn = build_snn_graph(candidates, prune_method=prune_method, logger=log)
+    snn = build_snn_graph(
+        candidates,
+        X=X,
+        prune_method=prune_method,
+        rescue_edges=rescue_edges,
+        rescue_cos_threshold=rescue_cos_threshold,
+        logger=log,
+    )
     log.info(f"  Step 2 took {time.time() - t0:.1f}s")
 
     mode = "pygen"
@@ -96,11 +121,16 @@ def run_pipeline(
     # Step 3: Architecture discovery
     if mode == "pygen":
         from pipeline.discovery import run_pygenstability_discovery
-        ms_result = run_pygenstability_discovery(snn, logger=log)
+        ms_result = run_pygenstability_discovery(
+            snn,
+            per_component=per_component_discovery,
+            min_component_size=min_component_size,
+            logger=log,
+        )
         
-        # TASK A: PyGen Fallback Rule
+        # PyGen Fallback Rule
         if len(ms_result["levels"]) < 3:
-            log.warning("  ⚠ PyGen returned < 3 feasible scales. Falling back to default Leiden multiscale grid.")
+            log.warning("  [FALLBACK] PyGen → manual grid: returned < 3 feasible scales.")
             if resolution_grid is None:
                 resolution_grid = DEFAULT_RESOLUTIONS
             ms_result = run_leiden_multiscale(
@@ -118,7 +148,13 @@ def run_pipeline(
         
     elif mode == "profile":
         from pipeline.discovery import run_resolution_profile_discovery
-        ms_result = run_resolution_profile_discovery(snn, objective_function=objective_function, logger=log)
+        ms_result = run_resolution_profile_discovery(
+            snn,
+            objective_function=objective_function,
+            per_component=per_component_discovery,
+            min_component_size=min_component_size,
+            logger=log,
+        )
         hierarchy = build_cluster_hierarchy(ms_result, logger=log)
         log.info(f"  Resolution profile discovery took {time.time() - t0:.1f}s")
         
@@ -156,6 +192,8 @@ def run_pipeline(
         consensus_runs=5,
         seed=seed,
         objective_function=objective_function,
+        target_cluster_ratio=target_cluster_ratio,
+        max_selected_levels=max_selected_levels,
         logger=log,
     )
     log.info(f"  Step 4 (Scoring) took {time.time() - t0:.1f}s")
@@ -168,6 +206,12 @@ def run_pipeline(
         edge_connectivity_threshold=edge_connectivity_threshold,
         output_level=output_level,
         k_neighbors=k,
+        homology_rescue=homology_rescue,
+        homology_rescue_cos=homology_rescue_cos,
+        cross_branch_rescue=cross_branch_rescue,
+        cross_branch_cos=cross_branch_cos,
+        cross_branch_edge=cross_branch_edge,
+        max_cross_branch_merges=max_cross_branch_merges,
         logger=log,
     )
     log.info(f"  Step 5 took {time.time() - t0:.1f}s")
@@ -181,6 +225,7 @@ def run_pipeline(
             prot_meta,
             graph=snn.get("graph"),
             level_name=level_name,
+            extended_eval=extended_eval,
             logger=log,
         )
     log.info(f"  Step 6 took {time.time() - t0:.1f}s")
@@ -216,6 +261,19 @@ def run_pipeline(
         "device": device,
         "phate_levels": phate_result["cluster_counts"] if phate_result else None,
         "total_time_sec": total_time,
+        # New config entries
+        "rescue_edges": rescue_edges,
+        "rescue_cos_threshold": rescue_cos_threshold,
+        "homology_rescue": homology_rescue,
+        "homology_rescue_cos": homology_rescue_cos,
+        "cross_branch_rescue": cross_branch_rescue,
+        "cross_branch_cos": cross_branch_cos,
+        "cross_branch_edge": cross_branch_edge,
+        "target_cluster_ratio": target_cluster_ratio,
+        "max_selected_levels": max_selected_levels,
+        "extended_eval": extended_eval,
+        "per_component_discovery": per_component_discovery,
+        "min_component_size": min_component_size,
     }
 
     return {
@@ -256,7 +314,23 @@ def parse_args():
     parser.add_argument("--use_profile", action="store_true", help="Use leidenalg.resolution_profile for scale discovery")
     parser.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration when available (FAISS GPU, PyTorch CUDA).")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--selection_policy", type=str, default="best_composite", choices=["best_composite", "max_stability", "best_density", "elbow"], help="Scale selection policy")
+    parser.add_argument("--selection_policy", type=str, default="best_composite", choices=["best_composite", "max_stability", "elbow"], help="Scale selection policy")
+
+    # ── New recall-oriented flags ──
+    parser.add_argument("--no_rescue_edges", action="store_true", help="Disable hybrid rescue edges in graph builder (default: on)")
+    parser.add_argument("--rescue_cos_threshold", type=float, default=0.92, help="Cosine threshold for rescue edge eligibility (default: 0.92)")
+    parser.add_argument("--homology_rescue", action="store_true", help="Enable homology-rescue merge path for small clusters with very high cosine")
+    parser.add_argument("--homology_rescue_cos", type=float, default=0.95, help="Cosine threshold for homology-rescue merges (default: 0.95)")
+    parser.add_argument("--cross_branch_rescue", action="store_true", help="Enable cross-branch merge rescue after cascade")
+    parser.add_argument("--cross_branch_cos", type=float, default=0.93, help="Cosine threshold for cross-branch rescue (default: 0.93)")
+    parser.add_argument("--cross_branch_edge", type=float, default=0.03, help="Edge connectivity threshold for cross-branch rescue (default: 0.03)")
+    parser.add_argument("--max_cross_branch_merges", type=int, default=500, help="Max cross-branch merges per pass (default: 500)")
+    parser.add_argument("--target_cluster_ratio", type=float, default=None, help="Soft prior for target K as fraction of N (default: 1/3)")
+    parser.add_argument("--max_selected_levels", type=int, default=None, help="Max hierarchy levels to select (default: 6)")
+    parser.add_argument("--extended_eval", action="store_true", help="Enable size-binned, B-cubed, and split/merge evaluation")
+    parser.add_argument("--no_per_component_discovery", action="store_true", help="Disable per-component PyGen/profile discovery (default: on)")
+    parser.add_argument("--min_component_size", type=int, default=50, help="Min component size for per-component discovery (default: 50)")
+
     return parser.parse_args()
 
 def main():
@@ -299,6 +373,20 @@ def main():
         no_pygen=args.no_pygen,
         use_profile=args.use_profile,
         use_gpu=args.use_gpu,
+        # New parameters
+        rescue_edges=not args.no_rescue_edges,
+        rescue_cos_threshold=args.rescue_cos_threshold,
+        homology_rescue=args.homology_rescue,
+        homology_rescue_cos=args.homology_rescue_cos,
+        cross_branch_rescue=args.cross_branch_rescue,
+        cross_branch_cos=args.cross_branch_cos,
+        cross_branch_edge=args.cross_branch_edge,
+        max_cross_branch_merges=args.max_cross_branch_merges,
+        target_cluster_ratio=args.target_cluster_ratio,
+        max_selected_levels=args.max_selected_levels,
+        extended_eval=args.extended_eval,
+        per_component_discovery=not args.no_per_component_discovery,
+        min_component_size=args.min_component_size,
         logger=logger,
     )
     save_results(results, results_path, args.organism, logger=logger)

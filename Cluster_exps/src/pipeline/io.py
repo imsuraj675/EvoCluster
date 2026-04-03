@@ -119,23 +119,55 @@ def save_results(results, results_path, organism, logger=None):
     with open(pkl_path, "wb") as f:
         pickle.dump(save_data, f)
     log.info(f"Saved results to: {pkl_path}")
+
+    # ── Main summary TSV ──
     tsv_path = os.path.join(results_path, f"{organism}_multiscale_summary.tsv")
     headers = [
         "level", "n_clusters", "n_singletons",
         "pairwise_P", "pairwise_R", "pairwise_F1",
         "TP", "FP", "FN", "TN",
         "AMI", "score",
+        "bcubed_P", "bcubed_R", "bcubed_F1",
     ]
     with open(tsv_path, "w") as f:
         f.write("\t".join(headers) + "\n")
         for level_name, m in results["metrics"].items():
             pairwise = m["pairwise"]
+            ext = m.get("extended", {})
+            bcubed = ext.get("bcubed", {})
             row = [
                 level_name, str(m["n_clusters"]), str(m["n_singletons"]),
                 f"{pairwise['precision']:.4f}", f"{pairwise['recall']:.4f}", f"{pairwise['f1']:.4f}",
                 str(pairwise["TP"]), str(pairwise["FP"]), str(pairwise["FN"]), str(pairwise["TN"]),
                 f"{m['AMI']:.4f}", f"{m['primary_score']:.4f}",
+                f"{bcubed.get('bcubed_precision', 0.0):.4f}",
+                f"{bcubed.get('bcubed_recall', 0.0):.4f}",
+                f"{bcubed.get('bcubed_f1', 0.0):.4f}",
             ]
             f.write("\t".join(row) + "\n")
     log.info(f"Saved summary to: {tsv_path}")
+
+    # ── Extended size-binned TSV ──
+    has_extended = any("extended" in m for m in results["metrics"].values())
+    if has_extended:
+        ext_tsv_path = os.path.join(results_path, f"{organism}_size_binned.tsv")
+        ext_headers = ["level", "bin", "n_proteins", "n_groups", "P", "R", "F1"]
+        with open(ext_tsv_path, "w") as f:
+            f.write("\t".join(ext_headers) + "\n")
+            for level_name, m in results["metrics"].items():
+                ext = m.get("extended", {})
+                size_bins = ext.get("size_binned", {})
+                for bin_name, bm in size_bins.items():
+                    row = [
+                        level_name, bin_name,
+                        str(bm.get("n_proteins", 0)),
+                        str(bm.get("n_groups", 0)),
+                        f"{bm.get('precision', 0.0):.4f}",
+                        f"{bm.get('recall', 0.0):.4f}",
+                        f"{bm.get('f1', 0.0):.4f}",
+                    ]
+                    f.write("\t".join(row) + "\n")
+        log.info(f"Saved size-binned metrics to: {ext_tsv_path}")
+
     save_diagnostic_plots(results, results_path, organism, logger=log)
+

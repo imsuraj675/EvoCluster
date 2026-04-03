@@ -76,10 +76,11 @@ graph TD
     A[Raw ESM-C 1520-dim] -->|PCA 400 + Scale + L2 Norm| B(Prepared Embeddings)
     B -->|FAISS HNSW| C(Candidate Neighbors)
     C -->|Jaccard Similarity| D{SNN Graph + Pruning}
-    D -->|Quality Gate >= 95%| E(Multiscale Architecture Discovery)
+    D -->|Hybrid Rescue Edges| D2(SNN + Rescue Graph)
+    D2 -->|Quality Gate >= 95%| E(Multiscale Architecture Discovery)
     
     subgraph Scale Discovery
-        E -->|Default| F1[PyGenStability]
+        E -->|Default per-component| F1[PyGenStability]
         E -->|--use_profile| F2[Resolution Profile]
         E -->|--no_pygen| F3[Manual Leiden Grid]
     end
@@ -88,12 +89,13 @@ graph TD
     F2 --> G
     F3 --> G
     
-    G -->|Plateau Detection + Target-Aware Band Selection| H(Up to 6 Selected Hierarchical Scales)
+    G -->|Soft Target Prior + Plateau + Elbow| H(Up to N Selected Hierarchical Scales)
     H -->|Cascaded Branch-Local Merge| I(Refinement + Normalization)
-    I --> J{Outputs}
+    I -->|Homology Rescue + Cross-Branch Rescue| I2(Rescue Merge Pass)
+    I2 --> J{Outputs}
     
-    J -->|Evaluation| K1[Pairwise P/R/F1 + AMI]
-    J -->|Validation| K2[CDlib Topological Metrics]
+    J -->|Evaluation| K1[Pairwise + B-cubed + Size-Binned P/R/F1]
+    J -->|Validation| K2[CDlib + Split/Merge + Family Types]
     J -->|Labels| K3[Coarse / Mid / Fine / Adaptive]
 ```
 
