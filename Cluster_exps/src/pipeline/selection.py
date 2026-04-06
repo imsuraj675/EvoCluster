@@ -13,8 +13,8 @@ def _is_feasible(n_clusters, n_singletons, N, logger=None):
 
     if n_clusters < 2:
         return False, f"K={n_clusters} < 2 (trivial single cluster)"
-    if avg_size < 2.0:
-        return False, f"avg_size={avg_size:.1f} < 2.0 (near-singleton)"
+    if avg_size < 1.3:
+        return False, f"avg_size={avg_size:.1f} < 1.3 (near-singleton)"
     if singleton_ratio > 0.5:
         return False, f"singleton_ratio={singleton_ratio:.2f} > 0.50"
     if n_clusters > 0.8 * N:
