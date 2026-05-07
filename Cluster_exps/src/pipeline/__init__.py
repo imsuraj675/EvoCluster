@@ -6,7 +6,11 @@ from .graph import compute_adaptive_k, build_candidate_neighbors, build_snn_grap
 from .leiden import run_leiden_multiscale, build_cluster_hierarchy
 from .selection import score_and_select_scales
 from .merge import refine_and_flatten
-from .evaluation import evaluate_clustering, get_ground_truth_stats, compute_pairwise_confusion_metrics
+from .evaluation import (
+    evaluate_clustering, get_ground_truth_stats, compute_pairwise_confusion_metrics,
+    extract_species_labels, compute_orthogroup_type_metrics,
+    compute_per_species_diagnostics,
+)
 from .evaluation_extended import (
     run_extended_evaluation,
     compute_size_binned_metrics,
@@ -14,5 +18,6 @@ from .evaluation_extended import (
     compute_split_merge_errors,
     classify_family_types,
 )
+from .diffusion import compute_diffused_embeddings
 from .discovery import run_pygenstability_discovery, run_resolution_profile_discovery
 # Core pipeline modules

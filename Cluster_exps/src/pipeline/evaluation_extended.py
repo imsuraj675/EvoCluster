@@ -180,6 +180,7 @@ def compute_bcubed_metrics(true_labels, pred_labels, logger=None):
     for gid, members in group_members.items():
         gc = Counter(int(pred_labels[i]) for i in members if int(pred_labels[i]) >= 0)
         group_cluster_counts[gid] = gc
+    counted_prec = 0
 
     for i in range(n):
         t = true_labels[i]
@@ -190,9 +191,9 @@ def compute_bcubed_metrics(true_labels, pred_labels, logger=None):
             cluster_size = len(cluster_members[p])
             same_true_in_cluster = cluster_true_counts[p].get(t, 0)
             prec_i = same_true_in_cluster / cluster_size
-        else:
-            # Unassigned items: precision = 1 if singleton, else 0
-            prec_i = 1.0  # singleton is trivially correct
+            sum_prec += prec_i
+            counted_prec += 1
+        # Unassigned items: excluded from precision average (no clustering signal)
 
         # Recall: among items in my true group, how many share my cluster?
         group_size = len(group_members[t])
@@ -202,11 +203,10 @@ def compute_bcubed_metrics(true_labels, pred_labels, logger=None):
         else:
             rec_i = 1.0 / group_size  # only itself
 
-        sum_prec += prec_i
         sum_rec += rec_i
         counted += 1
 
-    bcubed_p = sum_prec / counted if counted > 0 else 0.0
+    bcubed_p = sum_prec / counted_prec if counted_prec > 0 else 0.0
     bcubed_r = sum_rec / counted if counted > 0 else 0.0
     bcubed_f1 = (
         2 * bcubed_p * bcubed_r / (bcubed_p + bcubed_r)
@@ -297,14 +297,17 @@ def compute_split_merge_errors(true_labels, pred_labels, logger=None):
 
 def classify_family_types(true_labels, pred_labels, logger=None):
     """
-    Classify each true orthogroup by its mapping relationship:
+    Classify each true orthogroup by its prediction mapping relationship.
 
-    - 1:1 — maps to exactly one predicted cluster (and that cluster has only
-             this group)
-    - 1:m — split across multiple predicted clusters
-    - m:1 — merged with other groups into one cluster
+    NOTE: These types describe how predictions MAP to true groups, NOT the
+    biological species composition (which is handled by
+    ``compute_orthogroup_type_metrics`` in ``evaluation.py``).
 
-    Compute P/R/F1 for proteins belonging to each type.
+    Mapping types:
+      - clean         — maps to exactly one predicted cluster, and that cluster
+                        contains only this group (perfect 1:1 mapping)
+      - fragmented    — split across multiple predicted clusters
+      - contaminated  — merged with other groups into one cluster
 
     Returns
     -------
@@ -323,17 +326,17 @@ def classify_family_types(true_labels, pred_labels, logger=None):
             group_to_clusters[t].add(int(p))
             cluster_to_groups[int(p)].add(t)
 
-    # Classify each group
+    # Classify each group by its prediction mapping
     group_type = {}
     for g, clusters in group_to_clusters.items():
         if len(clusters) == 1:
             c = next(iter(clusters))
             if len(cluster_to_groups.get(c, set())) == 1:
-                group_type[g] = "1:1"
+                group_type[g] = "clean"
             else:
-                group_type[g] = "m:1"
+                group_type[g] = "contaminated"
         else:
-            group_type[g] = "1:m"
+            group_type[g] = "fragmented"
 
     # For groups that never appeared in a cluster (all members unassigned)
     all_groups = set(true_labels)
@@ -342,7 +345,7 @@ def classify_family_types(true_labels, pred_labels, logger=None):
             group_type[g] = "unassigned"
 
     type_counts = Counter(group_type.values())
-    log.debug(f"  Family types: {dict(type_counts)}")
+    log.debug(f"  Mapping types: {dict(type_counts)}")
 
     # Compute per-type pairwise metrics
     results = {"types": group_type, "type_counts": dict(type_counts)}
@@ -352,7 +355,7 @@ def classify_family_types(true_labels, pred_labels, logger=None):
     for i, t in enumerate(true_labels):
         group_members[t].append(i)
 
-    for ftype in ["1:1", "1:m", "m:1"]:
+    for ftype in ["clean", "fragmented", "contaminated"]:
         indices = []
         for g, gt in group_type.items():
             if gt == ftype:
@@ -398,7 +401,7 @@ def classify_family_types(true_labels, pred_labels, logger=None):
             "n_groups": type_counts.get(ftype, 0),
         }
         log.debug(
-            f"  Family type [{ftype}]: P={precision:.3f} R={recall:.3f} F1={f1:.3f} "
+            f"  Mapping type [{ftype}]: P={precision:.3f} R={recall:.3f} F1={f1:.3f} "
             f"({len(indices)} prots, {type_counts.get(ftype, 0)} groups)"
         )
 

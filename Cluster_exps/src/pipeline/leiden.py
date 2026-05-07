@@ -46,7 +46,6 @@ def run_leiden_multiscale(
     log.info(f"Step 3a: Running Leiden multiscale — {len(resolution_grid)} resolutions")
 
     levels = []
-    label_matrix = np.zeros((N, len(resolution_grid)), dtype=np.int32)
     weights = g.es['weight'] if 'weight' in g.edge_attributes() else None
 
     if objective_function.upper() == "CPM":
@@ -80,7 +79,7 @@ def run_leiden_multiscale(
 
         log.info(f"  res={res:.3f} → K={n_clusters} clusters (min={min_s}, max={max_s}, med={med_s}, singletons={n_singletons})")
 
-        label_matrix[:, r_idx] = labels
+
         levels.append({
             "resolution": res,
             "labels": labels,
@@ -89,7 +88,7 @@ def run_leiden_multiscale(
             "sizes": sizes,
         })
 
-    return {"levels": levels, "label_matrix": label_matrix, "resolution_grid": sorted(resolution_grid)}
+    return {"levels": levels, "resolution_grid": sorted(resolution_grid)}
 
 def build_cluster_hierarchy(multiscale_result, *, logger=None):
     log = logger or logging.getLogger("multiscale")

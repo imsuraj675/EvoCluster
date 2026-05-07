@@ -44,12 +44,32 @@ def plot_results(study, organism):
     print(f"\nSaved rapid visualization to: {out_img}")
     print(f"Saved raw tracking data to: {out_csv}")
 
+    # ── Precision-Recall tradeoff plot ──
+    if "user_attrs_precision" in df.columns and "user_attrs_recall" in df.columns:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sc = ax.scatter(
+            df["user_attrs_recall"], df["user_attrs_precision"],
+            c=df["value"], cmap="viridis", alpha=0.7, s=40, edgecolor="black", linewidth=0.5,
+        )
+        plt.colorbar(sc, label="F1")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_title("Precision vs Recall (colored by F1)")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(True, linestyle='--', alpha=0.4)
+        pr_img = f"sweep_fast_{organism}_pr_tradeoff.png"
+        fig.savefig(pr_img, dpi=150)
+        plt.close(fig)
+        print(f"Saved P-R tradeoff plot to: {pr_img}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Lightning Fast In-Memory Sweeper for Merge Parameters")
     parser.add_argument("organism", type=str, help="Dataset organism code (e.g. pfal_pber)")
     parser.add_argument("--n_trials", type=int, default=50, help="Number of merge trials to run")
     parser.add_argument("--k_coeff", type=float, default=0.6, help="Fixed k_coeff for the graph base")
+    parser.add_argument("--diffusion_alpha", type=float, default=0.0, help="SGC diffusion alpha (0=disabled)")
     args = parser.parse_args()
 
     organism = args.organism
@@ -78,7 +98,7 @@ def main():
     X, X_pca, N = prep["X"], prep["X_pca"], prep["N"]
 
     # 2. SNN Graph
-    k = compute_adaptive_k(N, coeff=args.k_coeff, cap=150)
+    k = compute_adaptive_k(N, coeff=args.k_coeff, cap=250)
     candidates = build_candidate_neighbors(X, k_candidates=k, use_gpu=False, logger=logger)
     snn = build_snn_graph(
         candidates, X=X, prune_method="inverse_k", 
@@ -98,6 +118,15 @@ def main():
     )
     
     logger.info(f"\n[+] ONE-TIME EXPENSIVE SETUP COMPLETED IN {time.time() - t0_setup:.1f} SECONDS.")
+
+    # Compute diffusion if enabled
+    diffusion_X_alpha = None
+    if args.diffusion_alpha > 0:
+        from pipeline.diffusion import compute_diffused_embeddings
+        diffusion_X_alpha, _ = compute_diffused_embeddings(
+            X_pca, snn["adjacency"], alpha=args.diffusion_alpha, logger=logger
+        )
+
     logger.info("[+] COMMENCING HIGH-SPEED OPTUNA MERGE SWEEP...\n")
 
     # -------------------------------------------------------------
@@ -126,6 +155,8 @@ def main():
                 homology_rescue=True,
                 homology_rescue_cos=homology_cos,
                 cross_branch_rescue=False,
+                diffusion_alpha=args.diffusion_alpha,
+                diffusion_X_alpha=diffusion_X_alpha,
                 logger=logger,
             )
 
@@ -140,11 +171,15 @@ def main():
             )
             
             f1 = metrics["primary_score"] # This is Pairwise F1
+            precision = metrics["pairwise"]["precision"]
+            recall = metrics["pairwise"]["recall"]
         finally:
             # Restore logging
             logger.setLevel(old_level)
-            
-        print(f"  Trial #{trial.number:02d} | cos:{centroid_cos:.2f} edge:{edge_conn:.2f} hom:{homology_cos:.2f}  => F1: {f1:.4f}  (Took {time.time() - t_trial:.1f}s)")
+
+        trial.set_user_attr("precision", precision)
+        trial.set_user_attr("recall", recall)
+        print(f"  Trial #{trial.number:02d} | cos:{centroid_cos:.2f} edge:{edge_conn:.2f} hom:{homology_cos:.2f}  => P={precision:.4f} R={recall:.4f} F1: {f1:.4f}  (Took {time.time() - t_trial:.1f}s)")
         return f1
 
     # Execute study inside this single python process
@@ -158,7 +193,11 @@ def main():
         
     print("\n" + "=" * 60)
     if len(study.trials) > 0 and study.best_trial:
+        best_p = study.best_trial.user_attrs.get("precision", 0.0)
+        best_r = study.best_trial.user_attrs.get("recall", 0.0)
         print(f"BEST RUN: Trial #{study.best_trial.number} (Pairwise F1 = {study.best_value:.4f})")
+        print(f"  Precision: {best_p:.4f}")
+        print(f"  Recall: {best_r:.4f}")
         print("BEST PARAMETERS:")
         for k_param, v in study.best_trial.params.items():
             print(f"  {k_param}: {v:.2f}")

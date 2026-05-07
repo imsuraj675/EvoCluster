@@ -63,9 +63,9 @@ Validated that ESM-C embeddings hold strong evolutionary signal in high dimensio
 
 Evaluated ProtT5, ESM2, ESM-C, and ESM1 across 114 Pfam families using Evolutionary Similarity Scores (ESS). **Selected ESM-C layer 34** as the optimal model + layer combination based on Spearman/Pearson correlations against LG evolutionary distances.
 
-### Phase 2 — Clustering for Orthogroup Formation 🔧 (Active)
+### Phase 2 — Clustering for Orthogroup Formation ✅
 
-Implementing and evaluating the **multiscale SNN + Leiden clustering pipeline** to form orthogroups from embeddings.
+Implemented and evaluated the **multiscale SNN + Leiden clustering pipeline** to form orthogroups from embeddings. After extensive hyperparameter optimization using Bayesian sweeps (Optuna), the pipeline achieves **40–50% pairwise F1** across biological datasets.
 
 ---
 
@@ -94,8 +94,8 @@ graph TD
     I -->|Homology Rescue + Cross-Branch Rescue| I2(Rescue Merge Pass)
     I2 --> J{Outputs}
     
-    J -->|Evaluation| K1[Pairwise + B-cubed + Size-Binned P/R/F1]
-    J -->|Validation| K2[CDlib + Split/Merge + Family Types]
+    J -->|Evaluation| K1[Pairwise + B-cubed + Size-Binned + V-measure]
+    J -->|Validation| K2[CDlib + Split/Merge + Mapping Types]
     J -->|Labels| K3[Coarse / Mid / Fine / Adaptive]
 ```
 
@@ -122,8 +122,8 @@ Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 ### Stage 2: SNN Graph Construction
 
 #### 2a. Adaptive k Computation
-- **Formula**: `k = min(ceil(0.6 × √N), 150)`
-- Examples: N=40k → k=120, N=50k → k=134, N=60k → k=147
+- **Formula**: `k = min(ceil(0.6 × √N), 250)`
+- Examples: N=40k → k=120, N=100k → k=190, N=200k → k=250
 
 #### 2b. Candidate Neighbor Search
 - **FAISS HNSW** for fast approximate kNN (with sklearn fallback)
@@ -138,7 +138,7 @@ Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 
 #### 3a. Multiscale Resolution Sweep
 - **PyGenStability (Default)**: Runs a bounded Markov-stability sweep first and keeps only feasible distinct candidate partitions.
-- **Resolution Profile** (`--use_profile`): Extracts Leiden plateau stability states with bounded resolution range and post-thinning by K-spacing.
+- **Resolution Profile** (`--use_profile`): Extracts Leiden plateau stability states with bounded resolution range and post-thinning by K-spacing. On disconnected graphs, profiles are computed per sizable component and merged into full-dataset candidate levels before hierarchy construction.
 - **Manual Grid** (`--no_pygen`): Runs predefined Leiden CPM resolutions `[0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30, 0.45, 0.60, 0.80, 1.00]`.
 - Returns label matrix (N × n_resolutions)
 
@@ -177,7 +177,7 @@ Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 | Metric Type | Description |
 |---|---|
 | **Pairwise Precision / Recall / F1** | Protein-pair agreement between predicted clusters and true orthogroups |
-| **AMI** | Adjusted Mutual Information vs true orthogroup assignments |
+| **Information Theoretic** | Adjusted Mutual Information (AMI), V-measure, Homogeneity, Completeness |
 | **Topological** | (CDlib) Modularity, Conductance, Density, Internal Density, Node Coverage (diagnostic only) |
 
 ---
@@ -205,7 +205,7 @@ Each organism folder contains:
 | ESM-C layer | 34 |
 | PCA dimension | 400 |
 | k coefficient | 0.6 |
-| k cap | 150 |
+| k cap | 250 |
 | SNN metric | Jaccard Similarity |
 | SNN prune method | `inverse_k` (threshold = 1/k) |
 | Edge connectivity norm | `n_cross / (min(|A|,|B|) × k)` |
@@ -228,7 +228,16 @@ Each organism folder contains:
 3. `--use_phate` — Automatic scale discovery (replaces manual --resolutions)
 4. `--centroid_cos_threshold` — Merge criterion Path B (0.75–0.95). Lower = more merging
 5. `--edge_connectivity_threshold` — Edge min(A,B) threshold (0.01–0.20). Lower = easier merge
-6. `--selection_policy` — currently only `best_composite` is meaningfully implemented; other CLI values alias the same scorer with a warning
+6. `--selection_policy` — `best_composite` (default), `elbow`, or `max_stability`
+
+### Automated Hyperparameter Optimization
+
+Two Optuna-based sweeper scripts are provided for systematic parameter tuning:
+
+- **`sweep_parameters.py`** — Parallel bilevel sweep: outer loop over `k_coeff` (graph structure) via Joblib, inner loop over merge thresholds via Optuna
+- **`sweep_merge_fast.py`** — Single-graph fast sweep: builds the graph + hierarchy once, then runs Optuna trials over merge parameters only
+
+These were used to produce the final optimized results reported below.
 
 ---
 
@@ -273,7 +282,7 @@ Preprocessing:
 
 Graph:
   --k_coeff           k = coeff * sqrt(N) (default: 0.6)
-  --k_cap             Max k (default: 150)
+  --k_cap             Max k (default: 250)
   --k_override        Override adaptive k with fixed value
   --prune_method      SNN pruning: inverse_k | percentile
 
@@ -321,9 +330,10 @@ MajorProject/
 │   └── prep_data.py / run_prep.py         # Data preparation
 ├── Cluster_exps/
 │   └── src/
-│       ├── multi_scale_exp.py             # Active CLI entrypoint
-│       ├── debug_pipeline_validation.py   # Synthetic/component validation suite
-│       └── pipeline/                      # ★ Active modular pipeline package
+│       ├── multi_scale_exp.py             # CLI entrypoint
+│       ├── sweep_parameters.py            # Parallel bilevel hyperparameter sweeper (Optuna + Joblib)
+│       ├── sweep_merge_fast.py            # Fast single-graph merge parameter sweeper (Optuna)
+│       └── pipeline/                      # ★ Modular pipeline package
 ├── extras/                                # Docs + reference materials + legacy helpers
 │   ├── context.md                         # Full project context document
 │   ├── pipeline.md                        # Current pipeline design doc
@@ -335,6 +345,24 @@ MajorProject/
 │   └── {method}/{organism}/
 └── Cluster_Results/                       # Legacy results
 ```
+
+---
+
+## Results
+
+After systematic hyperparameter optimization (Bayesian sweeps via Optuna across graph, discovery, and merge parameters), the pipeline achieves the following pairwise F1 scores:
+
+| Dataset | Pairwise F1 Range |
+|---|---|
+| `pfal_pber` | 40–50% |
+| `mmus_hsap` | 40–50% |
+| `drer_xtro` | 40–50% |
+
+**Key observations:**
+- Precision tends to be high (embeddings are discriminative), but recall is the main bottleneck — the pipeline tends to over-fragment large orthogroups
+- The multiscale architecture successfully recovers both small and large clusters, but the merge step remains sensitive to threshold calibration
+- Rescue edges and per-component discovery improve coverage but do not fully close the recall gap
+- The embedding-based approach runs significantly faster than traditional BLAST + MCL pipelines
 
 ---
 
@@ -366,4 +394,4 @@ MajorProject/
 
 ---
 
-*Last updated: 2026-03-28*
+*Last updated: 2026-04-24*

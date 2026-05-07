@@ -50,8 +50,33 @@ def plot_nested_results(all_studies_data, organism):
         print(f"\n[+] Saved global optimization metric plot to: {out_img}")
         print(f"[+] Saved complete trial log to: sweep_nested_{organism}_full_results.csv")
 
+    # ── Precision-Recall tradeoff plot ──
+    if combined:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for data in all_studies_data:
+            df = data["df"]
+            df_complete = df[df["state"] == "COMPLETE"]
+            if "user_attrs_precision" in df_complete.columns and "user_attrs_recall" in df_complete.columns:
+                ax.scatter(
+                    df_complete["user_attrs_recall"],
+                    df_complete["user_attrs_precision"],
+                    alpha=0.6, s=30,
+                    label=f"k={data['k_coeff']}",
+                )
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_title("Precision vs Recall Across All Trials")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(True, linestyle='--', alpha=0.4)
+        ax.legend()
+        pr_img = f"sweep_nested_{organism}_pr_tradeoff.png"
+        fig.savefig(pr_img, dpi=150)
+        plt.close(fig)
+        print(f"[+] Saved P-R tradeoff plot to: {pr_img}")
 
-def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta):
+
+def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, diffusion_alpha=0.0):
     # Setup isolated logger for parallel process output safety
     logger_name = f"{organism}_sweep_k{k_coeff}"
     logger = setup_logging(logger_name)
@@ -63,13 +88,21 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta):
     
     t_graph = time.time()
     
-    k = compute_adaptive_k(N, coeff=k_coeff, cap=150)
+    k = compute_adaptive_k(N, coeff=k_coeff, cap=250)
     logger.info(f"[*] Computed adaptive K = {k} for N={N} with coeff={k_coeff}")
     candidates = build_candidate_neighbors(X, k_candidates=k, use_gpu=False, logger=logger)
     snn = build_snn_graph(
         candidates, X=X, prune_method="inverse_k", 
         rescue_edges=True, rescue_cos_threshold=0.92, logger=logger
     )
+
+    # Compute diffusion if alpha > 0
+    diffusion_X_alpha = None
+    if diffusion_alpha > 0:
+        from pipeline.diffusion import compute_diffused_embeddings
+        diffusion_X_alpha, _ = compute_diffused_embeddings(
+            X_pca, snn["adjacency"], alpha=diffusion_alpha, logger=logger
+        )
 
     # Use profile discovery by default as requested
     ms_result = run_resolution_profile_discovery(
@@ -107,6 +140,8 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta):
                 homology_rescue=True,
                 homology_rescue_cos=homology_cos,
                 cross_branch_rescue=False,
+                diffusion_alpha=diffusion_alpha,
+                diffusion_X_alpha=diffusion_X_alpha,
                 logger=logger,
             )
             
@@ -119,14 +154,18 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta):
                 logger=logger
             )
             f1 = metrics["primary_score"]
+            precision = metrics["pairwise"]["precision"]
+            recall = metrics["pairwise"]["recall"]
         except Exception as e:
             logger.setLevel(old_level)
             logger.error(f"Error during merge test: {e}")
             raise optuna.TrialPruned()
         finally:
             logger.setLevel(old_level)
-            
-        print(f"    -> [k_coeff={k_coeff}] Trial #{trial.number:02d} | cos={centroid_cos:.2f} edge={edge_conn:.2f} hom={homology_cos:.2f}  =>  F1: {f1:.4f}")
+
+        trial.set_user_attr("precision", precision)
+        trial.set_user_attr("recall", recall)
+        print(f"    -> [k_coeff={k_coeff}] Trial #{trial.number:02d} | cos={centroid_cos:.2f} edge={edge_conn:.2f} hom={homology_cos:.2f}  =>  P={precision:.4f} R={recall:.4f} F1: {f1:.4f}")
         return f1
 
     study = optuna.create_study(direction="maximize", study_name=f"Evo_k{k_coeff}")
@@ -137,7 +176,9 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta):
     if len(study.trials) > 0:
         best_val = study.best_value
         best_params = study.best_trial.params
-        logger.info(f"[+] BEST for k_coeff={k_coeff}: Trial #{study.best_trial.number} achieved F1 = {best_val:.4f}")
+        best_p = study.best_trial.user_attrs.get("precision", 0.0)
+        best_r = study.best_trial.user_attrs.get("recall", 0.0)
+        logger.info(f"[+] BEST for k_coeff={k_coeff}: Trial #{study.best_trial.number} F1={best_val:.4f} P={best_p:.4f} R={best_r:.4f}")
     else:
         best_val = -1
         best_params = {}
@@ -153,9 +194,10 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta):
 def main():
     parser = argparse.ArgumentParser(description="Parallel Bilevel Sweeper (Outer: joblib, Inner: optuna)")
     parser.add_argument("organism", type=str, help="Dataset organism code (e.g. pfal_pber)")
-    parser.add_argument("--k_grid", type=str, default="0.3,0.45,0.6,0.75", help="Comma-separated list of k_coeffs to sweep")
+    parser.add_argument("--k_grid", type=str, default="0.4,0.5,0.6,0.7,0.8", help="Comma-separated list of k_coeffs to sweep")
     parser.add_argument("--inner_trials", type=int, default=30, help="Number of fast merge trials per k_coeff graph")
     parser.add_argument("--n_jobs", type=int, default=4, help="Number of outer loop graphs to construct in parallel")
+    parser.add_argument("--diffusion_alpha", type=float, default=0.0, help="SGC diffusion alpha (0=disabled)")
     args = parser.parse_args()
 
     organism = args.organism
@@ -192,7 +234,7 @@ def main():
     main_logger.info(f"Dispatching outer loops to {args.n_jobs} parallel cores. Check sub-logs for specific progress!")
     
     all_studies_data = Parallel(n_jobs=args.n_jobs)(
-        delayed(optimize_for_k)(k_coeff, organism, args.inner_trials, X, X_pca, N, prot_meta) 
+        delayed(optimize_for_k)(k_coeff, organism, args.inner_trials, X, X_pca, N, prot_meta, args.diffusion_alpha) 
         for k_coeff in k_coeffs
     )
 
@@ -213,7 +255,19 @@ def main():
     if best_global_config:
         print("WINNING CONFIGURATION:")
         for k, v in best_global_config.items():
-            print(f"  {k}: {v:.3f}")
+            if isinstance(v, float):
+                print(f"  {k}: {v:.3f}")
+            else:
+                print(f"  {k}: {v}")
+        # Report P/R breakdown for best
+        for data in all_studies_data:
+            if data["k_coeff"] == best_global_config.get("k_coeff"):
+                df = data["df"]
+                best_trial_num = df.loc[df["value"].idxmax()]
+                if "user_attrs_precision" in df.columns:
+                    print(f"  Precision: {best_trial_num.get('user_attrs_precision', 'N/A')}")
+                    print(f"  Recall: {best_trial_num.get('user_attrs_recall', 'N/A')}")
+                break
     print("=" * 60)
 
     plot_nested_results(all_studies_data, organism)

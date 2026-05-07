@@ -10,6 +10,7 @@ from pipeline.leiden import run_leiden_multiscale, build_cluster_hierarchy, DEFA
 from pipeline.selection import score_and_select_scales
 from pipeline.merge import refine_and_flatten
 from pipeline.evaluation import get_ground_truth_stats, evaluate_clustering
+from pipeline.diffusion import compute_diffused_embeddings
 
 def run_pipeline(
     *,
@@ -49,6 +50,7 @@ def run_pipeline(
     extended_eval=False,
     per_component_discovery=True,
     min_component_size=50,
+    diffusion_alpha=0.0,
     logger=None,
 ):
     """End-to-end multiscale SNN + Leiden pipeline."""
@@ -68,6 +70,7 @@ def run_pipeline(
     log.info(f"  Homology rescue: {homology_rescue} (cos>={homology_rescue_cos})")
     log.info(f"  Cross-branch rescue: {cross_branch_rescue}")
     log.info(f"  Extended eval: {extended_eval}")
+    log.info(f"  SGC diffusion alpha: {diffusion_alpha}")
     log.info(f"  Output level: {output_level}")
     log.info("=" * 60)
     if alpha != 0.5:
@@ -106,6 +109,15 @@ def run_pipeline(
         logger=log,
     )
     log.info(f"  Step 2 took {time.time() - t0:.1f}s")
+
+    # Step 2b: SGC diffusion (if enabled)
+    diffusion_X_alpha = None
+    if diffusion_alpha > 0:
+        t0 = time.time()
+        diffusion_X_alpha, _ = compute_diffused_embeddings(
+            X_pca, snn["adjacency"], alpha=diffusion_alpha, logger=log
+        )
+        log.info(f"  Step 2b (SGC diffusion) took {time.time() - t0:.1f}s")
 
     mode = "pygen"
     if use_phate:
@@ -212,6 +224,8 @@ def run_pipeline(
         cross_branch_cos=cross_branch_cos,
         cross_branch_edge=cross_branch_edge,
         max_cross_branch_merges=max_cross_branch_merges,
+        diffusion_alpha=diffusion_alpha,
+        diffusion_X_alpha=diffusion_X_alpha,
         logger=log,
     )
     log.info(f"  Step 5 took {time.time() - t0:.1f}s")
@@ -274,6 +288,7 @@ def run_pipeline(
         "extended_eval": extended_eval,
         "per_component_discovery": per_component_discovery,
         "min_component_size": min_component_size,
+        "diffusion_alpha": diffusion_alpha,
     }
 
     return {
@@ -330,6 +345,7 @@ def parse_args():
     parser.add_argument("--extended_eval", action="store_true", help="Enable size-binned, B-cubed, and split/merge evaluation")
     parser.add_argument("--no_per_component_discovery", action="store_true", help="Disable per-component PyGen/profile discovery (default: on)")
     parser.add_argument("--min_component_size", type=int, default=50, help="Min component size for per-component discovery (default: 50)")
+    parser.add_argument("--diffusion_alpha", type=float, default=0.0, help="SGC diffusion mixing coefficient (0=disabled, default: 0.0)")
 
     return parser.parse_args()
 
@@ -389,6 +405,7 @@ def main():
         extended_eval=args.extended_eval,
         per_component_discovery=not args.no_per_component_discovery,
         min_component_size=args.min_component_size,
+        diffusion_alpha=args.diffusion_alpha,
         logger=logger,
     )
     save_results(results, results_path, args.organism, logger=logger)

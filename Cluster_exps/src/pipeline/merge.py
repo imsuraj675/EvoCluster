@@ -26,6 +26,8 @@ def refine_and_flatten(
     cross_branch_cos=0.93,
     cross_branch_edge=0.03,
     max_cross_branch_merges=500,
+    diffusion_alpha=0.0,
+    diffusion_X_alpha=None,
     logger=None,
 ):
     from .evaluation import relabel_contiguous
@@ -47,6 +49,10 @@ def refine_and_flatten(
     log.info(f"  Graph-aware normalization — k={k}")
     log.info(f"  Homology rescue: {homology_rescue} (cos>={homology_rescue_cos}, max_size<={homology_rescue_max_size})")
     log.info(f"  Cross-branch rescue: {cross_branch_rescue} (cos>={cross_branch_cos}, edge>={cross_branch_edge}, max={max_cross_branch_merges})")
+    if diffusion_alpha > 0 and diffusion_X_alpha is not None:
+        log.info(f"  SGC diffusion: alpha={diffusion_alpha:.2f} (applied in final cascade stage only)")
+    else:
+        log.info(f"  SGC diffusion: disabled")
 
     adj_csr = adjacency.tocsr() if not hasattr(adjacency, 'indptr') else adjacency
 
@@ -79,15 +85,24 @@ def refine_and_flatten(
             "stage_summaries": [],
         }
 
+    # Escalation magnitudes: controls how much thresholds relax from the first
+    # cascade stage (strictest) to the last (loosest).  Quadratic ramp means
+    # early stages stay very close to the base threshold while the final stage
+    # gets the full relaxation budget.  Values were empirically tuned on
+    # pfal_pber / mmus_hsap to keep precision drops < 5% at max escalation.
+    COS_ESCALATION  = 0.10   # allows up to +10% cosine relaxation at final stage
+    EDGE_ESCALATION = 0.05   # allows up to +5% edge-connectivity relaxation
+    STRONG_ESCALATION = 0.05 # same for the strong-edge shortcut path
+
     stage_thresholds = []
     for s_idx in range(n_stages):
         t_linear = s_idx / max(n_stages - 1, 1) if n_stages > 1 else 0.0
         # Quadratic escalation for modest early-stage loosening
         t_quad = t_linear ** 2
         
-        cos_t  = centroid_cos_threshold    + 0.10 * t_quad
-        edge_t = edge_connectivity_threshold + 0.05 * t_quad
-        strong_t = edge_strong_threshold + 0.05 * t_quad
+        cos_t  = centroid_cos_threshold    + COS_ESCALATION * t_quad
+        edge_t = edge_connectivity_threshold + EDGE_ESCALATION * t_quad
+        strong_t = edge_strong_threshold + STRONG_ESCALATION * t_quad
         stage_thresholds.append({
             "cos": min(cos_t, 0.98),
             "edge": min(edge_t, 0.50),
@@ -119,6 +134,14 @@ def refine_and_flatten(
 
         log.info(f"  ── Stage {s_idx+1}: guide=L{guide_idx} (K={guide_K}) → fine=L{fine_idx} (K={fine_K})")
 
+        is_final_stage = (s_idx == n_stages - 1)
+        use_diffused = (
+            is_final_stage
+            and diffusion_alpha > 0
+            and diffusion_X_alpha is not None
+        )
+        X_centroids = diffusion_X_alpha if use_diffused else X
+
         stage_result = _cascade_merge_stage(
             X=X,
             guide_labels=guide_labels,
@@ -131,6 +154,8 @@ def refine_and_flatten(
             homology_rescue=homology_rescue,
             homology_rescue_cos=homology_rescue_cos,
             homology_rescue_max_size=homology_rescue_max_size,
+            X_centroids=X_centroids,
+            is_final_stage=is_final_stage,
             logger=log,
         )
 
@@ -144,7 +169,8 @@ def refine_and_flatten(
         log.info(
             f"    → Merges: {stage_result['n_merges']} "
             f"(rejected: {stage_result['n_rejected']}, "
-            f"homology_rescue: {stage_result.get('n_homology_rescues', 0)}) → K={result_K}"
+            f"homology_rescue: {stage_result.get('n_homology_rescues', 0)}, "
+            f"size_rescue: {stage_result.get('n_size_rescues', 0)}) → K={result_K}"
         )
         stage_summaries.append({
             "stage": s_idx + 1,
@@ -156,6 +182,7 @@ def refine_and_flatten(
             "n_merges": stage_result["n_merges"],
             "n_rejected": stage_result["n_rejected"],
             "n_homology_rescues": stage_result.get("n_homology_rescues", 0),
+            "n_size_rescues": stage_result.get("n_size_rescues", 0),
             "cos_threshold": thresholds["cos"],
             "edge_threshold": thresholds["edge"],
             "strong_threshold": thresholds["strong"],
@@ -182,8 +209,10 @@ def refine_and_flatten(
     # ── Cross-branch rescue pass ──
     n_cross_branch_merges = 0
     if cross_branch_rescue:
+        # Use diffused embeddings for cross-branch centroids if available
+        cb_X_centroids = diffusion_X_alpha if (diffusion_alpha > 0 and diffusion_X_alpha is not None) else X
         cb_result = _cross_branch_rescue(
-            X=X,
+            X=cb_X_centroids,
             fine_labels=fine_out,
             coarse_labels=coarse_out,
             adj_csr=adj_csr,
@@ -427,6 +456,7 @@ def _cascade_merge_stage(
     X, guide_labels, fine_labels, adj_csr, k,
     cos_threshold, edge_threshold, strong_threshold,
     homology_rescue=False, homology_rescue_cos=0.95, homology_rescue_max_size=20,
+    X_centroids=None, is_final_stage=False,
     logger=None,
 ):
     log = logger or logging.getLogger("multiscale")
@@ -436,6 +466,11 @@ def _cascade_merge_stage(
     n_merges = 0
     n_rejected = 0
     n_homology_rescues = 0
+    n_size_rescues = 0
+
+    # X_centroids defaults to X if not provided (non-diffused)
+    if X_centroids is None:
+        X_centroids = X
 
     cluster_info = {}
     for fid in set(merged[merged >= 0].tolist()):
@@ -443,6 +478,7 @@ def _cascade_merge_stage(
         cluster_info[fid] = {
             "members": set(members.tolist()),
             "sum": X[members].sum(axis=0),
+            "sum_centroids": X_centroids[members].sum(axis=0),
             "count": len(members),
         }
 
@@ -486,8 +522,9 @@ def _cascade_merge_stage(
         return n_cross, n_cross / denom if denom > 0 else 0.0
 
     def _centroid_cos(fi, fj):
-        ci_vec = cluster_info[fi]["sum"] / max(cluster_info[fi]["count"], 1)
-        cj_vec = cluster_info[fj]["sum"] / max(cluster_info[fj]["count"], 1)
+        """Centroid cosine using X_centroids (possibly diffused)."""
+        ci_vec = cluster_info[fi]["sum_centroids"] / max(cluster_info[fi]["count"], 1)
+        cj_vec = cluster_info[fj]["sum_centroids"] / max(cluster_info[fj]["count"], 1)
         ni, nj = np.linalg.norm(ci_vec), np.linalg.norm(cj_vec)
         return float(np.dot(ci_vec, cj_vec) / (ni * nj + EPS))
 
@@ -530,9 +567,25 @@ def _cascade_merge_stage(
                 f"(sizes {cluster_info[fi]['count']},{cluster_info[fj]['count']})"
             )
             merge_source = "homology_rescue"
+        # Path D: size-aware final rescue — ratio-based check, final stage only
+        elif (
+            is_final_stage
+            and homology_rescue
+            and cos_sim >= homology_rescue_cos
+        ):
+            size_a = cluster_info[fi]["count"]
+            size_b = cluster_info[fj]["count"]
+            size_ratio = max(size_a, size_b) / max(min(size_a, size_b), 1)
+            if size_ratio <= 3.0 or max(size_a, size_b) <= 10:
+                passes = True
+                reason = (
+                    f"size_rescue cos={cos_sim:.3f}>={homology_rescue_cos:.3f} "
+                    f"ratio={size_ratio:.1f} (sizes {size_a},{size_b})"
+                )
+                merge_source = "size_rescue"
 
         if passes:
-            if merge_source == "homology_rescue":
+            if merge_source in ("homology_rescue", "size_rescue"):
                 # Prioritize rescue paths to execute before local clusters swell in size
                 score = 1.0 + cos_sim 
             else:
@@ -547,6 +600,7 @@ def _cascade_merge_stage(
 
         info_i["members"].update(info_j["members"])
         info_i["sum"] = info_i["sum"] + info_j["sum"]
+        info_i["sum_centroids"] = info_i["sum_centroids"] + info_j["sum_centroids"]
         info_i["count"] += info_j["count"]
 
         for node in info_j["members"]:
@@ -655,6 +709,8 @@ def _cascade_merge_stage(
             n_merges += 1
             if merge_source == "homology_rescue":
                 n_homology_rescues += 1
+            elif merge_source == "size_rescue":
+                n_size_rescues += 1
 
             for other in list(cluster_neighbors.get(fi, set())):
                 if other not in branch_set or other not in cluster_info:
@@ -670,5 +726,6 @@ def _cascade_merge_stage(
         "n_merges": n_merges,
         "n_rejected": n_rejected,
         "n_homology_rescues": n_homology_rescues,
+        "n_size_rescues": n_size_rescues,
         "merge_log": merge_log,
     }

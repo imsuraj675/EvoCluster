@@ -42,7 +42,7 @@ def log_device_info(logger, use_gpu: bool = True):
     logger.info(f"  Device: {device}")
     if device == "cuda":
         logger.info(f"    GPU: {torch.cuda.get_device_name(0)}")
-        vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info(f"    VRAM: {vram:.1f} GB")
     elif use_gpu:
         logger.info(f"    (GPU requested but CUDA not available — using CPU)")
@@ -126,8 +126,11 @@ def save_results(results, results_path, organism, logger=None):
         "level", "n_clusters", "n_singletons",
         "pairwise_P", "pairwise_R", "pairwise_F1",
         "TP", "FP", "FN", "TN",
-        "AMI", "score",
+        "AMI", "V_measure", "Homogeneity", "Completeness", "score",
         "bcubed_P", "bcubed_R", "bcubed_F1",
+        "oto_P", "oto_R", "oto_F1",
+        "otm_P", "otm_R", "otm_F1",
+        "ntm_P", "ntm_R", "ntm_F1",
     ]
     with open(tsv_path, "w") as f:
         f.write("\t".join(headers) + "\n")
@@ -135,14 +138,31 @@ def save_results(results, results_path, organism, logger=None):
             pairwise = m["pairwise"]
             ext = m.get("extended", {})
             bcubed = ext.get("bcubed", {})
+            og_types = m.get("orthogroup_types", {})
+            oto = og_types.get("1:1", {})
+            otm = og_types.get("1:m", {})
+            ntm = og_types.get("n:m", {})
             row = [
                 level_name, str(m["n_clusters"]), str(m["n_singletons"]),
                 f"{pairwise['precision']:.4f}", f"{pairwise['recall']:.4f}", f"{pairwise['f1']:.4f}",
                 str(pairwise["TP"]), str(pairwise["FP"]), str(pairwise["FN"]), str(pairwise["TN"]),
-                f"{m['AMI']:.4f}", f"{m['primary_score']:.4f}",
+                f"{m['AMI']:.4f}",
+                f"{m.get('v_measure', 0.0):.4f}",
+                f"{m.get('homogeneity', 0.0):.4f}",
+                f"{m.get('completeness', 0.0):.4f}",
+                f"{m['primary_score']:.4f}",
                 f"{bcubed.get('bcubed_precision', 0.0):.4f}",
                 f"{bcubed.get('bcubed_recall', 0.0):.4f}",
                 f"{bcubed.get('bcubed_f1', 0.0):.4f}",
+                f"{oto.get('precision', 0.0):.4f}",
+                f"{oto.get('recall', 0.0):.4f}",
+                f"{oto.get('f1', 0.0):.4f}",
+                f"{otm.get('precision', 0.0):.4f}",
+                f"{otm.get('recall', 0.0):.4f}",
+                f"{otm.get('f1', 0.0):.4f}",
+                f"{ntm.get('precision', 0.0):.4f}",
+                f"{ntm.get('recall', 0.0):.4f}",
+                f"{ntm.get('f1', 0.0):.4f}",
             ]
             f.write("\t".join(row) + "\n")
     log.info(f"Saved summary to: {tsv_path}")
