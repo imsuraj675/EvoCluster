@@ -32,6 +32,9 @@ def main():
     parser = argparse.ArgumentParser(description="Alpha Sweep for SGC Feature Diffusion")
     parser.add_argument("organism", type=str, help="Dataset organism code (e.g. pfal_pber)")
     parser.add_argument("--k_coeff", type=float, default=0.6, help="Fixed k_coeff (default: 0.6)")
+    parser.add_argument("--centroid_cos", type=float, default=0.96, help="Merge centroid cosine threshold (default: 0.96)")
+    parser.add_argument("--edge_conn", type=float, default=0.10, help="Merge edge connectivity threshold (default: 0.10)")
+    parser.add_argument("--homology_cos", type=float, default=0.98, help="Homology rescue cosine threshold (default: 0.98)")
     parser.add_argument(
         "--alphas", type=str, default="0.0,0.2,0.4,0.6,0.8,0.9,1.0",
         help="Comma-separated alpha values to sweep",
@@ -117,12 +120,12 @@ def main():
         try:
             refined = refine_and_flatten(
                 X_pca, snn, hierarchy, stability, ms_result,
-                centroid_cos_threshold=0.85,
-                edge_connectivity_threshold=0.05,
+                centroid_cos_threshold=args.centroid_cos,
+                edge_connectivity_threshold=args.edge_conn,
                 output_level="fine",
                 k_neighbors=k,
                 homology_rescue=True,
-                homology_rescue_cos=0.95,
+                homology_rescue_cos=args.homology_cos,
                 cross_branch_rescue=False,
                 diffusion_alpha=alpha,
                 diffusion_X_alpha=X_alpha,

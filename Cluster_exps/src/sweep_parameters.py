@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
 
 from pipeline.io import setup_logging, load_embeddings, prepare_embeddings
-from pipeline.graph import compute_adaptive_k, build_candidate_neighbors, build_snn_graph
+from pipeline.graph import compute_adaptive_k, build_candidate_neighbors, build_snn_graph, build_knn_graph
 from pipeline.leiden import build_cluster_hierarchy
 from pipeline.discovery import run_resolution_profile_discovery
 from pipeline.selection import score_and_select_scales
@@ -76,9 +76,9 @@ def plot_nested_results(all_studies_data, organism):
         print(f"[+] Saved P-R tradeoff plot to: {pr_img}")
 
 
-def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, diffusion_alpha=0.0):
+def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, graph_type, diffusion_alpha=0.0):
     # Setup isolated logger for parallel process output safety
-    logger_name = f"{organism}_sweep_k{k_coeff}"
+    logger_name = f"{organism}_sweep_{graph_type}_k{k_coeff}"
     logger = setup_logging(logger_name)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -91,10 +91,13 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, di
     k = compute_adaptive_k(N, coeff=k_coeff, cap=250)
     logger.info(f"[*] Computed adaptive K = {k} for N={N} with coeff={k_coeff}")
     candidates = build_candidate_neighbors(X, k_candidates=k, use_gpu=False, logger=logger)
-    snn = build_snn_graph(
-        candidates, X=X, prune_method="inverse_k", 
-        rescue_edges=True, rescue_cos_threshold=0.92, logger=logger
-    )
+    if graph_type == "knn":
+        snn = build_knn_graph(candidates, logger=logger)
+    else:
+        snn = build_snn_graph(
+            candidates, X=X, prune_method="inverse_k", 
+            rescue_edges=True, rescue_cos_threshold=0.92, logger=logger
+        )
 
     # Compute diffusion if alpha > 0
     diffusion_X_alpha = None
@@ -194,7 +197,8 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, di
 def main():
     parser = argparse.ArgumentParser(description="Parallel Bilevel Sweeper (Outer: joblib, Inner: optuna)")
     parser.add_argument("organism", type=str, help="Dataset organism code (e.g. pfal_pber)")
-    parser.add_argument("--k_grid", type=str, default="0.4,0.5,0.6,0.7,0.8", help="Comma-separated list of k_coeffs to sweep")
+    parser.add_argument("--k_grid", type=str, default="0.3,0.45,0.6,0.75", help="Comma-separated list of k_coeffs to sweep")
+    parser.add_argument("--graph_type", type=str, default="snn", choices=["snn", "knn"], help="Graph architecture (snn or knn)")
     parser.add_argument("--inner_trials", type=int, default=30, help="Number of fast merge trials per k_coeff graph")
     parser.add_argument("--n_jobs", type=int, default=4, help="Number of outer loop graphs to construct in parallel")
     parser.add_argument("--diffusion_alpha", type=float, default=0.0, help="SGC diffusion alpha (0=disabled)")
@@ -212,6 +216,7 @@ def main():
     
     main_logger.info("=" * 60)
     main_logger.info(f"PARALLEL BILEVEL SWEEP: {organism}")
+    main_logger.info(f"Graph Type: {args.graph_type.upper()}")
     main_logger.info(f"Target k_coeffs: {k_coeffs}")
     main_logger.info(f"Outer Parallel Workers (n_jobs): {args.n_jobs}")
     main_logger.info(f"Inner Range per Graph: {args.inner_trials} Trials")
@@ -234,7 +239,7 @@ def main():
     main_logger.info(f"Dispatching outer loops to {args.n_jobs} parallel cores. Check sub-logs for specific progress!")
     
     all_studies_data = Parallel(n_jobs=args.n_jobs)(
-        delayed(optimize_for_k)(k_coeff, organism, args.inner_trials, X, X_pca, N, prot_meta, args.diffusion_alpha) 
+        delayed(optimize_for_k)(k_coeff, organism, args.inner_trials, X, X_pca, N, prot_meta, args.graph_type, args.diffusion_alpha) 
         for k_coeff in k_coeffs
     )
 

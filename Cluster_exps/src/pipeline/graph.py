@@ -137,6 +137,59 @@ def _add_rescue_edges(
     return n_rescue
 
 
+def build_knn_graph(candidate_neighbors, logger=None):
+    """Build a simple KNN graph (cosine similarity as edge weights, no Jaccard)."""
+    import igraph as ig
+    from scipy import sparse
+    log = logger or logging.getLogger("multiscale")
+
+    N = candidate_neighbors["N"]
+    nbr_indices = candidate_neighbors["indices"]
+    nbr_scores = candidate_neighbors["scores"]
+
+    edge_weights = {}
+    for i in range(N):
+        for rank, j in enumerate(nbr_indices[i]):
+            if j <= i:
+                continue
+            cos_sim = nbr_scores[i][rank]
+            if cos_sim <= 0:
+                continue
+            key = (i, j)
+            if key in edge_weights:
+                edge_weights[key] = max(edge_weights[key], cos_sim)
+            else:
+                edge_weights[key] = cos_sim
+
+    edge_list = list(edge_weights.keys())
+    weight_list = list(edge_weights.values())
+
+    g = ig.Graph(n=N, edges=edge_list, directed=False)
+    g.es["weight"] = weight_list
+
+    mean_degree = 2.0 * g.ecount() / N if N > 0 else 0.0
+    components = g.connected_components()
+    giant_pct = 100.0 * max(len(c) for c in components) / N if N > 0 else 0.0
+
+    log.info(f"  KNN graph: {g.ecount()} edges, mean_degree={mean_degree:.1f}, giant={giant_pct:.1f}%")
+
+    rows = [e[0] for e in edge_list] + [e[1] for e in edge_list]
+    cols = [e[1] for e in edge_list] + [e[0] for e in edge_list]
+    data = list(weight_list) + list(weight_list)
+    adjacency = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
+
+    return {
+        "graph": g,
+        "adjacency": adjacency,
+        "n_edges": g.ecount(),
+        "n_nodes": N,
+        "stats": {
+            "giant_component_pct": giant_pct,
+            "mean_degree": mean_degree,
+        }
+    }
+
+
 def build_snn_graph(
     candidate_neighbors,
     *,

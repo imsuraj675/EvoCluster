@@ -5,7 +5,7 @@ import numpy as np
 import logging
 
 from pipeline.io import setup_logging, log_device_info, load_embeddings, prepare_embeddings, save_results
-from pipeline.graph import compute_adaptive_k, build_candidate_neighbors, build_snn_graph, run_phate_scale_discovery, map_phate_to_leiden_resolutions
+from pipeline.graph import compute_adaptive_k, build_candidate_neighbors, build_snn_graph, build_knn_graph
 from pipeline.leiden import run_leiden_multiscale, build_cluster_hierarchy, DEFAULT_RESOLUTIONS
 from pipeline.selection import score_and_select_scales
 from pipeline.merge import refine_and_flatten
@@ -36,6 +36,8 @@ def run_pipeline(
     no_pygen=False,
     use_profile=False,
     use_gpu=False,
+    graph_type="snn",
+    min_giant_component_pct=90.0,
     # ── New recall-oriented parameters ──
     rescue_edges=True,
     rescue_cos_threshold=0.92,
@@ -61,6 +63,7 @@ def run_pipeline(
     log.info("Multiscale SNN + Leiden Pipeline")
     device = log_device_info(log, use_gpu=use_gpu)
     log.info(f"  Dataset: {fasta_path}")
+    log.info(f"  Graph type: {graph_type}")
     log.info(f"  Layer: {layer}, PCA: {pca_dim}")
     log.info(f"  Adaptive k: coeff={k_coeff}, cap={k_cap}" + (f", override={k_override}" if k_override else ""))
     log.info(f"  PHATE scale discovery: {use_phate}")
@@ -94,21 +97,29 @@ def run_pipeline(
     N = prep["N"]
     log.info(f"  Step 1 took {time.time() - t0:.1f}s")
 
-    # Step 2: SNN graph
+    # Step 2: Graph construction
     t0 = time.time()
     k = k_override if k_override else compute_adaptive_k(N, coeff=k_coeff, cap=k_cap)
     log.info(f"  Adaptive k = {k} (N={N})")
 
     candidates = build_candidate_neighbors(X, k_candidates=k, use_gpu=use_gpu, logger=log)
-    snn = build_snn_graph(
-        candidates,
-        X=X,
-        prune_method=prune_method,
-        rescue_edges=rescue_edges,
-        rescue_cos_threshold=rescue_cos_threshold,
-        logger=log,
-    )
-    log.info(f"  Step 2 took {time.time() - t0:.1f}s")
+    
+    if graph_type == "knn":
+        t0 = time.time()
+        snn = build_knn_graph(candidates, logger=log)
+        log.info(f"  Step 2 (KNN graph) took {time.time() - t0:.1f}s")
+    else:
+        t0 = time.time()
+        snn = build_snn_graph(
+            candidates,
+            X=X,
+            prune_method=prune_method,
+            min_giant_component_pct=min_giant_component_pct,
+            rescue_edges=rescue_edges,
+            rescue_cos_threshold=rescue_cos_threshold,
+            logger=log,
+        )
+        log.info(f"  Step 2 (SNN graph) took {time.time() - t0:.1f}s")
 
     # Step 2b: SGC diffusion (if enabled)
     diffusion_X_alpha = None
@@ -257,6 +268,7 @@ def run_pipeline(
         "pca_dim": pca_dim,
         "k_coeff": k_coeff,
         "k_cap": k_cap,
+        "graph_type": graph_type,
         "k_used": k,
         "prune_method": prune_method,
         "resolution_grid": resolution_grid,
@@ -328,6 +340,8 @@ def parse_args():
     parser.add_argument("--no_pygen", action="store_true", help="Disable default PyGenStability and use manual heuristic grid")
     parser.add_argument("--use_profile", action="store_true", help="Use leidenalg.resolution_profile for scale discovery")
     parser.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration when available (FAISS GPU, PyTorch CUDA).")
+    parser.add_argument("--graph_type", type=str, default="snn", choices=["snn", "knn"], help="Graph architecture to build (snn or knn)")
+    parser.add_argument("--min_giant_component_pct", type=float, default=90.0, help="Min percentage of nodes in giant component for SNN (default: 90.0)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--selection_policy", type=str, default="best_composite", choices=["best_composite", "max_stability", "elbow"], help="Scale selection policy")
 
@@ -391,6 +405,8 @@ def main():
         no_pygen=args.no_pygen,
         use_profile=args.use_profile,
         use_gpu=args.use_gpu,
+        graph_type=args.graph_type,
+        min_giant_component_pct=args.min_giant_component_pct,
         # New parameters
         rescue_edges=not args.no_rescue_edges,
         rescue_cos_threshold=args.rescue_cos_threshold,
