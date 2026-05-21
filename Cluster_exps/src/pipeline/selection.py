@@ -43,7 +43,8 @@ def _compute_mean_conductance_fast(labels, cluster_ids, sizes_arr, internal_coun
     vol_complement = total_vol - vol_c
     denom = np.minimum(vol_c, vol_complement)
 
-    cond_values = np.where(denom > 0, cut_c / denom, 0.0)
+    cond_values = np.zeros_like(cut_c, dtype=np.float64)
+    np.divide(cut_c, denom, out=cond_values, where=denom > 0)
 
     # Filter to clusters with >= 1 member (matching original skip logic)
     valid = sizes_arr >= 1
@@ -189,7 +190,8 @@ def score_and_select_scales(
             n_members_arr = sizes_full[cluster_ids]
             possible_arr = n_members_arr * (n_members_arr - 1) / 2.0
             internal_arr = internal_counts[cluster_ids].astype(np.float64)
-            densities_arr = np.where(possible_arr > 0, internal_arr / possible_arr, 0.0)
+            densities_arr = np.zeros(len(cluster_ids), dtype=np.float64)
+            np.divide(internal_arr, possible_arr, out=densities_arr, where=possible_arr > 0)
             cohesion = float(np.average(densities_arr, weights=sizes_arr))
 
             n_size1_clusters = int(np.sum(sizes_full[cluster_ids] == 1))
