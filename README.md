@@ -1,12 +1,12 @@
-# EvoCluster — Embedding-Based Ortholog Detection
+# EvoCluster — Embedding-Guided Multiscale Orthogroup Detection
 
 > **Can protein embeddings replace alignment-based ortholog detection?**
 >
-> EvoCluster uses ESM-C protein language model embeddings, PCA dimensionality reduction, and multiscale graph clustering to form orthogroups — faster and potentially more effective than traditional BLAST + MCL pipelines like OrthoFinder.
+> EvoCluster replaces the alignment-heavy core of orthogroup detection with protein language model (pLM) embeddings combined with a multiscale graph clustering pipeline. ESM-C embeddings are clustered using cosine kNN graphs, Leiden community detection under the CPM objective, automated resolution scale discovery, and a branch-local merge cascade to produce orthogroups — faster and more scalable than traditional BLAST + MCL pipelines like OrthoFinder.
 
-**Authors**: Hanzala Sharique, Suraj Kashyap, Samyajit Das <br>
-**Supervisor**: Prof. Ashish Kumar Layek <br>
-**Acknowledgements**: Dr. Soumitra Pal (National Eye Institute, USA) <br>
+**Authors**: Hanzala Sharique, Suraj Kashyap, Samyajit Das, and Ashish Kumar Layek <br>
+**Acknowledgement**: Dr. Soumitra Pal (National Eye Institute, USA) <br>
+**Affiliation**: Department of Computer Science and Technology, Indian Institute of Engineering Science and Technology, Shibpur <br>
 
 ---
 
@@ -17,22 +17,19 @@
 - [Pipeline Architecture](#pipeline-architecture)
 - [Pipeline Stages](#pipeline-stages)
 - [Datasets](#datasets)
-- [Evaluation Metrics](#evaluation-metrics)
+- [Results](#results)
 - [Configuration & Hyperparameters](#configuration--hyperparameters)
 - [Usage](#usage)
 - [Repository Structure](#repository-structure)
-- [Key Improvements Over Flat Clustering](#key-improvements-over-flat-clustering)
 - [References](#references)
 
 ---
 
 ## Background
 
-### Why Compare Proteins?
+### Why Orthogroups?
 
-- Diseased vs. healthy organisms differ at the protein level — finding the altered protein helps identify disease causes.
-- If the same protein exists in other species, they may be prone to the same disease and treatable similarly.
-- To do this, we need to know which proteins are **evolutionarily related** → these sets are called **orthogroups**.
+Orthogroups collect proteins that originate from a common ancestral gene. Because such proteins often retain related biological functions, the groups themselves are widely used for functional annotation, evolutionary analysis, and large-scale genome studies. Classical tools like OrthoFinder combine sequence similarity search, graph construction, and phylogenetic refinement — but they scale poorly and make limited use of modern representation learning.
 
 ### Key Terminology
 
@@ -40,32 +37,33 @@
 |------|-----------|
 | **Orthologs** | Homologous genes split by **speciation** across species |
 | **Paralogs** | Homologous genes split by **duplication** within a species |
-| **Orthogroups** | All related genes (orthologs + paralogs) descended from one original gene |
+| **Orthogroups** | All related genes (orthologs + paralogs) descended from one ancestral gene |
 | **pLM** | Protein Language Model — a neural network trained on protein sequences |
-| **Embeddings** | Numerical vector representations capturing functional/evolutionary properties |
+| **Embeddings** | Numerical vector representations encoding structural and evolutionary signals |
 
-### OrthoFinder Limitations
+### Motivation
 
-OrthoFinder (the current standard) has:
-- Strong dependence on sequence alignment quality
-- High computational cost on large datasets
-- No leverage of modern embedding-based approaches
+Protein language models replace repeated pairwise comparison with a single forward pass per sequence. Each protein is mapped to a dense vector that the model has learned to produce from its training distribution. If this learned geometry preserves homology strongly enough, then clustering directly in embedding space may be sufficient for orthogroup recovery — with no further sequence alignment.
 
 ---
 
 ## Project Phases
 
-### Phase 0 — Preliminary Validation ✅
+### Phase 1 — Homology Feature Capture with pLMs ✅
 
-Validated that ESM-C embeddings hold strong evolutionary signal in high dimensions using PCA + UMAP visualization on a small OrthoFinder example dataset.
+Benchmarked four pLMs (ESM-1, ESM-2, ESM-C, ProtT5) across 114 Pfam families by correlating embedding-space pairwise distances with LG tree distances built using FastTree. Both full-length and domain-only inputs were evaluated layer by layer.
 
-### Phase 1 — Model Benchmarking ✅
+**Key findings:**
+- ESM-C, despite being the lightest model, performs on par with ProtT5 and ESM-2 on deep layers
+- Restricting input to conserved domains gives nearly identical correlation curves
+- Deeper layers carry stronger homology information across all four models
+- Inter-family correlations are uniformly higher than intra-family values
 
-Evaluated ProtT5, ESM2, ESM-C, and ESM1 across 114 Pfam families using Evolutionary Similarity Scores (ESS). **Selected ESM-C layer 34** as the optimal model + layer combination based on Spearman/Pearson correlations against LG evolutionary distances.
+**Selected**: ESM-C, layer 34 as the embedding backbone.
 
-### Phase 2 — Clustering for Orthogroup Formation ✅
+### Phase 2 — Multiscale Clustering Pipeline ✅
 
-Implemented and evaluated the **multiscale SNN + Leiden clustering pipeline** to form orthogroups from embeddings. After extensive hyperparameter optimization using Bayesian sweeps (Optuna), the pipeline achieves **40–50% pairwise F1** across biological datasets.
+Built and evaluated the multiscale KNN + Leiden clustering pipeline. Tested alternative clustering methods (K-means, HDBSCAN, Agglomerative, single-resolution Leiden) and found that no single flat clustering approach could handle orthogroup sizes spanning two orders of magnitude. This motivated the multiscale design.
 
 ---
 
@@ -75,36 +73,32 @@ Implemented and evaluated the **multiscale SNN + Leiden clustering pipeline** to
 graph TD
     A[Raw ESM-C 1520-dim] -->|PCA 400 + Scale + L2 Norm| B(Prepared Embeddings)
     B -->|FAISS HNSW| C(Candidate Neighbors)
-    C -->|Jaccard Similarity| D{SNN Graph + Pruning}
-    D -->|Hybrid Rescue Edges| D2(SNN + Rescue Graph)
-    D2 -->|Quality Gate >= 95%| E(Multiscale Architecture Discovery)
+    C -->|Cosine kNN Graph| D{Adaptive Pruning}
+    D -->|Rescue Edges| D2(kNN + Rescue Graph)
+    D2 -->|Giant Component ≥ 95%| E(Resolution Scale Discovery)
     
     subgraph Scale Discovery
-        E -->|Default per-component| F1[PyGenStability]
-        E -->|--use_profile| F2[Resolution Profile]
-        E -->|--no_pygen| F3[Manual Leiden Grid]
+        E -->|Default| F1[Leidenalg Resolution Profile]
+        E -->|--resolutions| F2[Manual Resolution Grid]
     end
     
-    F1 --> G(Feasibility Filter + 6-Factor Scoring)
+    F1 --> G(Feasibility Filter + 6-Factor Composite Scoring)
     F2 --> G
-    F3 --> G
     
-    G -->|Soft Target Prior + Plateau + Elbow| H(Up to N Selected Hierarchical Scales)
-    H -->|Cascaded Branch-Local Merge| I(Refinement + Normalization)
-    I -->|Homology Rescue + Cross-Branch Rescue| I2(Rescue Merge Pass)
-    I2 --> J{Outputs}
+    G -->|Target-Aware Banding + Plateau| H(Up to 6 Selected Hierarchical Scales)
+    H -->|Cascaded Branch-Local Merge| I(Coarse-to-Fine Refinement)
+    I -->|Homology Rescue| I2(Rescue Merge Pass)
+    I2 --> J(Final Orthogroups)
     
-    J -->|Evaluation| K1[Pairwise + B-cubed + Size-Binned + V-measure]
-    J -->|Validation| K2[CDlib + Split/Merge + Mapping Types]
-    J -->|Labels| K3[Coarse / Mid / Fine / Adaptive]
+    J -->|Evaluation| K1[Pairwise Precision / Recall / F1]
 ```
 
 ### Core Principles
 
-1. **Graph quality > clustering algorithm** — Jaccard SNN graphs prune rare, spurious connections naturally
-2. **Multiscale structure > single resolution** — A single parameter can't handle varying orthogroup sizes
-3. **Local refinement > global merging** — Only siblings sharing a coarse parent can merge
-4. **Stability across scales > one-shot optimization** — Graph-aware metrics prevent misleading selections
+1. **Graph quality > clustering algorithm** — Pruned cosine kNN graphs remove spurious connections naturally
+2. **Multiscale structure > single resolution** — A single parameter can't handle orthogroup sizes from 2 to 200+
+3. **Local refinement > global merging** — Only siblings sharing a coarse parent can merge (no global O(K²))
+4. **Progressive stringency** — Merge thresholds tighten across cascade stages via quadratic escalation
 
 ---
 
@@ -116,83 +110,106 @@ graph TD
 Raw ESM-C (1520-dim) → PCA(400) → StandardScaler → L2-Normalize
 ```
 
-- **Function**: `prepare_embeddings()`
-- Extracts layer-34 embeddings, reduces to 400 dims, scales, and L2-normalizes for cosine kNN
+PCA dimension selected via scree plot analysis: ~400 principal components capture most of the variance across all four datasets while keeping the kNN graph construction manageable. L2 normalisation ensures inner products approximate cosine similarity.
 
-### Stage 2: SNN Graph Construction
+### Stage 2: Graph Construction
 
-#### 2a. Adaptive k Computation
-- **Formula**: `k = min(ceil(0.6 × √N), 250)`
-- Examples: N=40k → k=120, N=100k → k=190, N=200k → k=250
+#### Adaptive Neighbourhood Size
+The neighbourhood size k follows a square-root relationship with dataset size:
 
-#### 2b. Candidate Neighbor Search
+```
+k = min(⌈0.6 × √N⌉, 150)
+```
+
+This rule transfers across datasets without manual adjustment — from 10k to 60k+ proteins.
+
+#### Cosine kNN Graph
 - **FAISS HNSW** for fast approximate kNN (with sklearn fallback)
-- Returns neighbor indices, scores, and precomputed neighbor sets
-
-#### 2c. Jaccard SNN Graph + Adaptive Pruning
-- **SNN Weight**: Jaccard Similarity = `|kNN(i) ∩ kNN(j)| / |kNN(i) ∪ kNN(j)|`
-- **Pruning**: `inverse_k` (threshold = 1/k) or `percentile` (drop bottom N%)
-- **Quality Gate**: Giant component must be ≥ 95% of all nodes
+- **Adaptive pruning**: edges below `1/k` threshold are removed
+- **Rescue edges**: high-cosine-similarity pairs (≥ 0.92) get edges even if not in each other's kNN
+- **Quality gate**: giant component must cover ≥ 95% of the graph
 
 ### Stage 3: Architecture Discovery + Hierarchy
 
-#### 3a. Multiscale Resolution Sweep
-- **PyGenStability (Default)**: Runs a bounded Markov-stability sweep first and keeps only feasible distinct candidate partitions.
-- **Resolution Profile** (`--use_profile`): Extracts Leiden plateau stability states with bounded resolution range and post-thinning by K-spacing. On disconnected graphs, profiles are computed per sizable component and merged into full-dataset candidate levels before hierarchy construction.
-- **Manual Grid** (`--no_pygen`): Runs predefined Leiden CPM resolutions `[0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30, 0.45, 0.60, 0.80, 1.00]`.
-- Returns label matrix (N × n_resolutions)
+#### Resolution Scale Discovery
+- **Default**: `leidenalg` resolution profile — finds discrete transition points where the optimal partition under CPM changes. Preferred because it is aligned with the CPM objective, computationally cheap (single pass), and deterministic.
+- **Manual grid** (`--resolutions`): runs Leiden CPM at user-specified resolution values.
 
-#### 3b. Hierarchy Construction
-- **Argmax overlap**: Each fine cluster → parent with maximum membership overlap
-- No hard threshold — guarantees complete tree with no orphans
-- Weak parent-child links are warned but never dropped
+#### Hierarchy Construction
+Each fine cluster is linked to the coarser level by maximum membership overlap:
+
+```
+parent(Cf) = argmax |Cf ∩ Cc| / |Cf|
+```
+
+No hard threshold — guarantees a complete hierarchy with no orphan clusters.
 
 ### Stage 4: Stability + Scale Selection
 
-**Metrics computed per level** (6-factor composite):
-1. NMI between adjacent resolution levels
-2. **Cohesion**: Weighted intra-cluster edge density
-3. **Separation**: 1 − mean conductance
-4. **Size Regularizer**: Penalizes extreme fragmentation
-5. **Fragmentation Penalty**: Penalizes high singleton ratios
-6. **Consensus Stability**: Mean pairwise NMI across multiple Leiden seeds
+A composite stability score selects a subset of levels:
 
-**Selection mechanism**: Retains a coarse-to-fine subset with target-aware anchoring near a biologically plausible K region (roughly `N/3` when enough feasible levels exist), band-aware diversity, and K-monotonic ordering. The active implemented policy is `best_composite`.
+```
+S = 0.18·NMI + 0.18·Cohesion + 0.18·Separation + 0.12·SizeReg + 0.10·Consensus − 0.14·FragPenalty
+```
 
-### Stage 5: Branch-Local Refinement
+Combined with a **soft Gaussian prior** over the target cluster count (roughly N/3) to let the cascade settle on the scale best supported by the data. Up to 6 levels are retained with target-aware banding and K-spacing diversity.
 
-**No global O(K²) merging.** Only siblings under the same coarse parent are candidates.
+### Stage 5: Branch-Local Merge Cascade
 
-**Hybrid merge criterion**:
-1. Strong graph evidence alone can trigger a merge
-2. Otherwise both centroid cosine similarity and SNN edge connectivity must pass
+**No global O(K²) merging.** Cascaded merge from coarse to fine levels, with thresholds that tighten across stages via quadratic escalation:
 
-**Graph-aware normalization**:
-`edge_conn = n_cross / (min(|A|, |B|) × k)`
+```
+τ_cos(s) = τ_cos₀ + 0.10·t²
+τ_edge(s) = τ_edge₀ + 0.05·t²
+```
 
-**Multi-level output**: Returns coarse, mid, fine, and adaptive labels.
+where `t = s/(S−1)` is the normalised stage index.
+
+**Hybrid merge criterion**: strong edge connectivity alone can trigger a merge, or both centroid cosine similarity and edge connectivity must pass.
+
+**Homology rescue**: a post-merge pass allows small high-confidence clusters to merge when centroids are very close (cosine ≥ 0.95), even without a graph edge.
 
 ### Stage 6: Evaluation
 
 | Metric Type | Description |
 |---|---|
-| **Pairwise Precision / Recall / F1** | Protein-pair agreement between predicted clusters and true orthogroups |
-| **Information Theoretic** | Adjusted Mutual Information (AMI), V-measure, Homogeneity, Completeness |
-| **Topological** | (CDlib) Modularity, Conductance, Density, Internal Density, Node Coverage (diagnostic only) |
+| **Pairwise Precision / Recall / F1** | Protein-pair agreement (N:M and 1:1 matching) |
+| **Information Theoretic** | AMI, V-measure, Homogeneity, Completeness |
 
 ---
 
 ## Datasets
 
-| Dataset | Species | Description |
-|---------|---------|-------------|
-| `pfal_pber` | *P. falciparum* × *P. berghei* | Small benchmark |
-| `mmus_hsap` | *M. musculus* × *H. sapiens* | ~40k proteins |
-| `drer_xtro` | *D. rerio* × *X. tropicalis* | ~60k proteins |
+Four orthogroup datasets obtained from OrthoMCL:
 
-Each organism folder contains:
-- `index_to_label.csv` — maps integer index to protein header
-- `{index}.pt` — per-protein ESM-C embeddings
+| Dataset | Species | # Proteins | # Orthogroups |
+|---------|---------|-----------|--------------|
+| Frog–Zebrafish (`drer_xtro`) | *D. rerio* × *X. tropicalis* | 61,670 | 18,374 |
+| Mouse–Human (`mmus_hsap`) | *M. musculus* × *H. sapiens* | 45,087 | 16,659 |
+| Apicomplexa ×7 | 7 Apicomplexan species | 42,839 | 17,822 |
+| Plasmodium ×2 (`pfal_pber`) | *P. falciparum* × *P. berghei* | 10,263 | 5,315 |
+
+Each dataset includes per-protein ESM-C embeddings (1520-dimensional), a FASTA file, and OrthoMCL ground-truth labels.
+
+---
+
+## Results
+
+### Final Pipeline Performance
+
+| Dataset | Precision | Recall | F1 |
+|---------|-----------|--------|-----|
+| Frog–Zebrafish | 86.70 | 39.56 | 54.33 |
+| Mouse–Human | 82.26 | 27.43 | 41.14 |
+| Apicomplexa ×7 | 59.77 | 68.78 | 63.96 |
+| Plasmodium ×2 | 58.60 | 50.10 | 54.00 |
+
+### Key Observations
+
+- **Precision is consistently high** — ESM-C embeddings after PCA and L2 normalisation are discriminative enough that proteins from unrelated families rarely end up in the same cluster
+- **Recall is the harder side** — large reference orthogroups still tend to be split across more than one Leiden cluster, even after rescue edges, homology-driven merges, and the cascaded strategy
+- **The adaptive k rule transfers** across all datasets without manual adjustment (10k–60k proteins)
+- **A single global threshold is insufficient** — relaxed values over-merge at fine scales while strict values under-merge at coarse ones, justifying the multiscale design
 
 ---
 
@@ -204,194 +221,172 @@ Each organism folder contains:
 |---|---|
 | ESM-C layer | 34 |
 | PCA dimension | 400 |
-| k coefficient | 0.6 |
-| k cap | 250 |
-| SNN metric | Jaccard Similarity |
-| SNN prune method | `inverse_k` (threshold = 1/k) |
-| Edge connectivity norm | `n_cross / (min(|A|,|B|) × k)` |
-| Merge criterion | Hybrid OR (strong edge alone OR centroid+edge) |
+| Adaptive kNN coefficient | c = 0.6 |
+| kNN cap | 150 |
+| Cascade levels | 6 |
+| Prune method | `inverse_k` (threshold = 1/k) |
+| Edge connectivity norm | `n_cross / (min(\|A\|,\|B\|) × k)` |
 | Merge scoring | `0.7 × edge_conn + 0.3 × cos_sim` |
-| Stability composite | 6-factor composite `(NMI, Cohesion, Separation, Size, Consensus, -Frag)` |
-| Discovery mode | PyGenStability (default; bounded, with fallback to manual grid when too few feasible levels are found) |
-| Objective function | CPM |
-| Centroid merge threshold | 0.85 (cosine, with quadratic escalation per stage) |
-| Edge connectivity threshold | 0.05 (base, with quadratic escalation per stage) |
+| Centroid merge threshold | 0.85 (base, + quadratic escalation) |
+| Edge connectivity threshold | 0.05 (base, + quadratic escalation) |
 | Giant component gate | ≥ 95% |
-| Output level | `fine` |
+| Rescue edges | On (cosine ≥ 0.92) |
+| Homology rescue | On (cosine ≥ 0.95, cluster size ≤ 20) |
+| Discovery mode | Leidenalg Resolution Profile |
+| Objective function | CPM |
 | Evaluation primary score | Pairwise F1 |
-| PHATE scale discovery | Off (opt-in via `--use_phate`) |
 
-### Tuning Priority (in order of impact)
+### Hyperparameter Optimisation
 
-1. `--k_coeff` — Neighborhood coefficient (0.3–0.8). Higher = denser SNN graph, more merge opportunities
-2. `--resolutions` — Manual resolution grid. Lower values usually mean larger clusters
-3. `--use_phate` — Automatic scale discovery (replaces manual --resolutions)
-4. `--centroid_cos_threshold` — Merge criterion Path B (0.75–0.95). Lower = more merging
-5. `--edge_connectivity_threshold` — Edge min(A,B) threshold (0.01–0.20). Lower = easier merge
-6. `--selection_policy` — `best_composite` (default), `elbow`, or `max_stability`
+The dominant hyperparameters interact non-linearly. We used **Bayesian optimisation through Optuna** in two complementary modes:
 
-### Automated Hyperparameter Optimization
+- **`sweep_parameters.py`** — Bilevel parallel sweep: outer loop over `k_coeff ∈ {0.3, 0.45, 0.6, 0.75}` via Joblib, inner loop tunes merge thresholds
+- **`sweep_merge_fast.py`** — Fast single-graph sweep: builds graph + hierarchy once, then runs Optuna trials over merge parameters only
 
-Two Optuna-based sweeper scripts are provided for systematic parameter tuning:
-
-- **`sweep_parameters.py`** — Parallel bilevel sweep: outer loop over `k_coeff` (graph structure) via Joblib, inner loop over merge thresholds via Optuna
-- **`sweep_merge_fast.py`** — Single-graph fast sweep: builds the graph + hierarchy once, then runs Optuna trials over merge parameters only
-
-These were used to produce the final optimized results reported below.
+The optimiser converged on `c = 0.6` as the most consistent choice.
 
 ---
 
 ## Usage
 
-### Basic Run
+### Running the Pipeline
 
 ```bash
-cd Cluster_exps/src
+cd src/Phase\ 2
+python multi_scale_exp.py <organism>
+```
+
+where `<organism>` is one of `pfal_pber`, `mmus_hsap`, `drer_xtro`, etc.
+
+#### Examples
+
+```bash
+# Basic run with default settings (resolution profile discovery)
 python multi_scale_exp.py pfal_pber
-```
 
-### With Custom Resolutions
-
-```bash
+# With custom manual resolutions (disables profile discovery)
 python multi_scale_exp.py mmus_hsap --resolutions 0.05,0.1,0.2,0.5
-```
 
-### With Custom Graph Parameters
-
-```bash
+# With custom graph density
 python multi_scale_exp.py drer_xtro --k_coeff 0.3 --k_cap 120
+
+# With GPU acceleration
+python multi_scale_exp.py mmus_hsap --use_gpu
+
+# Disable rescue features
+python multi_scale_exp.py pfal_pber --no_rescue_edges --no_homology_rescue
 ```
 
-### With PHATE Automatic Scale Discovery
+### KNN vs SNN Comparison
 
 ```bash
-python multi_scale_exp.py mmus_hsap --use_phate
-python multi_scale_exp.py drer_xtro --use_phate --centroid_cos_threshold 0.80
+python compare_knn_snn.py pfal_pber mmus_hsap drer_xtro
 ```
-
-PHATE uses diffusion condensation to automatically discover natural data scales, then maps them to Leiden CPM resolutions via binary search. No manual `--resolutions` grid needed. Requires: `pip install git+https://github.com/KrishnaswamyLab/Multiscale_PHATE`
 
 ### All CLI Options
 
 ```
 python multi_scale_exp.py <organism> [OPTIONS]
 
-Preprocessing:
-  --layer             ESM-C layer (default: 34)
-  --pca_dim           PCA components (default: 400)
-
-Graph:
-  --k_coeff           k = coeff * sqrt(N) (default: 0.6)
-  --k_cap             Max k (default: 250)
-  --k_override        Override adaptive k with fixed value
-  --prune_method      SNN pruning: inverse_k | percentile
-
-Leiden:
-  --resolutions       Comma-separated CPM resolutions
-  --objective         CPM | modularity
-  --min_cluster_size  Recorded for traceability; currently not enforced in Leiden outputs
-
-Refinement:
-  --centroid_cos_threshold       Cosine merge threshold (default: 0.85)
-  --edge_connectivity_threshold  Edge connectivity threshold (default: 0.05)
-  --output_level                 coarse | fine | adaptive
-
-Evaluation:
-  --alpha             Deprecated; retained for CLI compatibility, no effect on pairwise evaluation
+Graph Construction:
+  --k_coeff           k = coeff × √N (default: 0.6)
+  --k_cap             Max k (default: 150)
+  --k_override        Override adaptive k with a fixed value
+  --graph_type        knn | snn (default: knn)
 
 Scale Discovery:
-  --use_phate         Enable PHATE automatic scale discovery
+  --resolutions       Comma-separated CPM resolutions (disables profile discovery)
+  --objective         CPM | modularity (default: CPM)
+
+Merge Refinement:
+  --centroid_cos_threshold       Base cosine merge threshold (default: 0.85)
+  --edge_connectivity_threshold  Base edge connectivity threshold (default: 0.05)
+  --no_homology_rescue           Disable homology-rescue merge path
+  --homology_rescue_cos          Cosine threshold for homology rescue (default: 0.95)
+
+Graph Rescue:
+  --no_rescue_edges              Disable hybrid rescue edges (default: on)
+  --rescue_cos_threshold         Cosine threshold for rescue edges (default: 0.92)
+
+Selection:
+  --target_cluster_ratio         Soft prior for target K as fraction of N (default: 1/3)
+  --max_selected_levels          Max hierarchy levels to select (default: 6)
 
 Other:
   --seed              Random seed (default: 0)
-  --selection_policy  best_composite | max_stability | best_density | elbow
+  --use_gpu           Use GPU acceleration (FAISS GPU)
 ```
+
+### Output
+
+Results are saved to `Model_Cluster_Results/multiscale/<organism>/` and include:
+- Cluster labels (fine level)
+- Full merge log and stage summaries
+- Per-level scoring details
+- Pairwise and information-theoretic evaluation metrics
 
 ---
 
 ## Repository Structure
 
 ```
-MajorProject/
+EvoCluster/
 ├── README.md                              ← This file
-├── OrthoMCL/                              # OrthoFinder reference outputs + embeddings
+├── EvoCluster.pdf                         # Research paper
+├── requiremets.txt                        # Python dependencies
 ├── data/                                  # Dataset files
 ├── results/                               # Experiment outputs
-├── src/                                   # Phase 1 scripts
-│   ├── utils.py                           # General utilities
-│   ├── utils_embeddings.py                # Embedding extraction utils
-│   ├── utils_get_embeddings.py            # pLM inference helpers
-│   ├── one_pfam.py / domain_one_pfam.py   # Single-family evaluation
-│   ├── make_corr.py / domain_make_corr.py # Correlation computation
-│   ├── homology_corr.py                   # Homology correlation analysis
-│   ├── build_matrix.py                    # Distance matrix construction
-│   ├── get_consensus.py                   # Consensus sequence generation
-│   ├── merge_trees.py                     # Unified tree construction
-│   └── prep_data.py / run_prep.py         # Data preparation
-├── Cluster_exps/
-│   └── src/
-│       ├── multi_scale_exp.py             # CLI entrypoint
-│       ├── sweep_parameters.py            # Parallel bilevel hyperparameter sweeper (Optuna + Joblib)
-│       ├── sweep_merge_fast.py            # Fast single-graph merge parameter sweeper (Optuna)
-│       └── pipeline/                      # ★ Modular pipeline package
-├── extras/                                # Docs + reference materials + legacy helpers
-│   ├── context.md                         # Full project context document
-│   ├── pipeline.md                        # Current pipeline design doc
-│   ├── multi_scale_exp_usage.md           # Practical usage guide
-│   ├── next_step.md                       # Current roadmap and status
-│   ├── pipeline_old.md                    # Earlier pipeline design
-│   └── run_all.py                         # Batch runner
-├── Model_Cluster_Results/                 # Per-method clustering results
-│   └── {method}/{organism}/
-└── Cluster_Results/                       # Legacy results
+├── src/
+│   ├── Phase 1/                           # pLM homology benchmarking
+│   │   ├── utils.py                       # General utilities
+│   │   ├── utils_embeddings.py            # Embedding extraction utils
+│   │   ├── utils_get_embeddings.py        # pLM inference helpers
+│   │   ├── one_pfam.py                    # Single-family evaluation
+│   │   ├── domain_one_pfam.py             # Domain-level evaluation
+│   │   ├── make_corr.py                   # Full-length correlation computation
+│   │   ├── domain_make_corr.py            # Domain-level correlation computation
+│   │   ├── homology_corr.py               # Cross-Pfam correlation analysis
+│   │   ├── build_matrix.py                # Distance matrix construction
+│   │   ├── get_consensus.py               # Consensus sequence generation
+│   │   ├── merge_trees.py                 # Unified LG tree construction
+│   │   ├── kmeans_exp.py                  # K-means baseline experiment
+│   │   └── prep_data.py / run_prep.py     # Data preparation
+│   └── Phase 2/                           # ★ Multiscale clustering pipeline
+│       ├── multi_scale_exp.py             # Main CLI entrypoint
+│       ├── sweep_parameters.py            # Bilevel hyperparameter sweeper (Optuna + Joblib)
+│       ├── sweep_merge_fast.py            # Fast merge parameter sweeper (Optuna)
+│       ├── compare_knn_snn.py             # KNN vs SNN graph comparison
+│       ├── run_baseline_algos.py          # Baseline clustering algorithms
+│       ├── run_simple_leiden.py           # Single-resolution Leiden baseline
+│       ├── cluster_lib.py                 # Clustering utilities
+│       └── pipeline/                      # Modular pipeline package
+│           ├── __init__.py                # Package exports
+│           ├── io.py                      # Data loading, embedding prep, result saving
+│           ├── graph.py                   # Cosine kNN graph construction + pruning
+│           ├── discovery.py               # Resolution profile discovery (leidenalg)
+│           ├── leiden.py                   # Leiden multiscale sweeps + hierarchy building
+│           ├── selection.py               # 6-factor composite scoring + scale selection
+│           ├── merge.py                   # Branch-local cascade merge refinement
+│           └── evaluation.py              # Pairwise F1, AMI, V-measure evaluation
+└── Model_Cluster_Results/                 # Per-method clustering results
+    └── multiscale/{organism}/
 ```
-
----
-
-## Results
-
-After systematic hyperparameter optimization (Bayesian sweeps via Optuna across graph, discovery, and merge parameters), the pipeline achieves the following pairwise F1 scores:
-
-| Dataset | Pairwise F1 Range |
-|---|---|
-| `pfal_pber` | 40–50% |
-| `mmus_hsap` | 40–50% |
-| `drer_xtro` | 40–50% |
-
-**Key observations:**
-- Precision tends to be high (embeddings are discriminative), but recall is the main bottleneck — the pipeline tends to over-fragment large orthogroups
-- The multiscale architecture successfully recovers both small and large clusters, but the merge step remains sensitive to threshold calibration
-- Rescue edges and per-component discovery improve coverage but do not fully close the recall gap
-- The embedding-based approach runs significantly faster than traditional BLAST + MCL pipelines
-
----
-
-## Key Improvements Over Flat Clustering
-
-| Problem | Old Approach | Multiscale Pipeline |
-|---|---|---|
-| Large clusters split | Increase k | Multiscale hierarchy |
-| Small clusters merged | Lower k | SNN + branch-local refinement |
-| Poor merging | Centroid-only | Hybrid: centroid + SNN edges |
-| Fixed prune threshold | 1/15 for all datasets | Adaptive: 1/k or percentile |
-| Broken hierarchy | Hard overlap threshold | Argmax overlap (no threshold) |
-| Misleading stability | NMI only | NMI + intra-cluster edge density |
-| Sparse graph | No quality check | Giant component ≥ 95% gate |
-| Single output | One flat clustering | Coarse / Mid / Fine / Adaptive |
-| Manual resolution grid | Trial-and-error | PHATE auto-discovery (opt-in) |
 
 ---
 
 ## References
 
-| Work | Relevance |
-|------|-----------|
-| **OrthoFinder** (Emms & Kelly 2019) | Reference benchmark for orthogroup detection |
-| **ESM-C** (EvolutionaryScale) | Lightweight pLM selected for this project |
-| **Multiscale PHATE** (Burkhardt et al. 2022) | Diffusion condensation for automatic scale discovery ([Nature Biotech](https://www.nature.com/articles/s41587-021-01186-x)) |
-| **plmEvo** (2025) | Shows pLMs encode homology/functional signals |
-| **ESM2 + k-Means** (2025) | Similar direction; we extend with advanced clustering |
+| # | Work | Relevance |
+|---|------|-----------|
+| 1 | **OrthoFinder** (Emms & Kelly 2019) | Reference benchmark for orthogroup detection |
+| 2 | **OrthoMCL** (Li et al. 2003) | Ground-truth orthogroup labels |
+| 3 | **ESM-C** (EvolutionaryScale 2024) | Lightweight pLM selected as embedding backbone |
+| 4 | **Minotto et al.** (2025) | pLM-based clustering protocol for ortholog detection |
+| 5 | **Leiden** (Traag et al. 2019) | Community detection algorithm used for clustering |
+| 6 | **FastTree** (Price et al. 2010) | Approximate ML trees for LG distance matrices |
+| 7 | **Optuna** (Akiba et al. 2019) | Bayesian hyperparameter optimisation framework |
+| 8 | **plmEvo** (Tule et al. 2025) | Shows pLMs encode phylogenetic signals |
 
 ---
 
-*Last updated: 2026-04-24*
+*Last updated: 2026-05-22*

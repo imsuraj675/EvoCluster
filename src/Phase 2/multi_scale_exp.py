@@ -212,7 +212,7 @@ def parse_args():
     parser.add_argument("--centroid_cos_threshold", type=float, default=0.85, help="Centroid cosine merge threshold (default: 0.85)")
     parser.add_argument("--edge_connectivity_threshold", type=float, default=0.05, help="SNN edge connectivity merge threshold (default: 0.05)")
     parser.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration when available (FAISS GPU, PyTorch CUDA).")
-    parser.add_argument("--graph_type", type=str, default="snn", choices=["snn", "knn"], help="Graph architecture to build (snn or knn)")
+    parser.add_argument("--graph_type", type=str, default="knn", choices=["snn", "knn"], help="Graph architecture to build (snn or knn)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
 
     # ── New recall-oriented flags ──
