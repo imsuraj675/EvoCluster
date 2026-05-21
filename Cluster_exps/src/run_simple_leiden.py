@@ -1,13 +1,13 @@
 """
 run_simple_leiden.py — Simple kNN + Leiden (no SNN, no multiscale)
 
-Runs Leiden clustering on a plain kNN graph at multiple resolutions
-with a fixed k, and plots Precision / Recall vs Resolution.
+Runs Leiden clustering on a plain kNN graph with fixed k=40 and
+resolution=0.6 by default, and reports pairwise plus orthogroup-type metrics.
 
 Usage:
     cd Cluster_exps/src
     python run_simple_leiden.py pfal_pber
-    python run_simple_leiden.py pfal_pber --k 40 --resolutions 0.2,0.4,0.5,0.6,0.8
+    python run_simple_leiden.py pfal_pber --k 40 --resolutions 0.6
 """
 
 import os
@@ -20,21 +20,52 @@ import matplotlib.pyplot as plt
 from pipeline.io import setup_logging, load_embeddings, prepare_embeddings
 from pipeline.evaluation import (
     extract_true_labels,
+    extract_species_labels,
     compute_pairwise_confusion_metrics,
+    compute_orthogroup_type_metrics,
 )
+
+
+def _metric_triplet(row, prefix):
+    """Format compact P/R/F1 output for one orthogroup type."""
+    return (
+        f"{row.get(f'{prefix}_P', 0.0):.3f}/"
+        f"{row.get(f'{prefix}_R', 0.0):.3f}/"
+        f"{row.get(f'{prefix}_F1', 0.0):.3f}"
+    )
+
+
+def _flatten_orthogroup_type_metrics(orthogroup_types):
+    """Flatten 1:1 / 1:m / n:m metrics into CSV-friendly columns."""
+    flattened = {}
+    column_prefixes = {
+        "1:1": "oto",
+        "1:m": "otm",
+        "n:m": "ntm",
+    }
+
+    for metric_name, prefix in column_prefixes.items():
+        values = orthogroup_types.get(metric_name, {})
+        flattened[f"{prefix}_P"] = float(values.get("precision", 0.0))
+        flattened[f"{prefix}_R"] = float(values.get("recall", 0.0))
+        flattened[f"{prefix}_F1"] = float(values.get("f1", 0.0))
+        flattened[f"{prefix}_n_proteins"] = int(values.get("n_proteins", 0))
+        flattened[f"{prefix}_n_groups"] = int(values.get("n_groups", 0))
+
+    return flattened
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Simple kNN + Leiden clustering at multiple resolutions"
+        description="Simple kNN + Leiden clustering with fixed k/resolution defaults"
     )
     parser.add_argument("organism", type=str, help="Organism code (e.g. pfal_pber)")
     parser.add_argument("--k", type=int, default=40, help="Fixed kNN k (default: 40)")
     parser.add_argument(
         "--resolutions",
         type=str,
-        default="0.2,0.4,0.5,0.6,0.8",
-        help="Comma-separated CPM resolutions",
+        default="0.6",
+        help="Comma-separated CPM resolutions (default: 0.6)",
     )
     parser.add_argument(
         "--objective",
@@ -125,6 +156,13 @@ def main():
         n_singletons = sum(1 for cid in set(labels) if np.sum(labels == cid) == 1)
 
         pairwise = compute_pairwise_confusion_metrics(true_labels, labels)
+        species_labels = extract_species_labels(prot_meta)
+        orthogroup_types = compute_orthogroup_type_metrics(
+            true_labels,
+            labels,
+            species_labels,
+            logger=logger,
+        )
         elapsed = time.time() - t_r
 
         record = {
@@ -139,12 +177,16 @@ def main():
             "FN": pairwise["FN"],
             "time_s": elapsed,
         }
+        record.update(_flatten_orthogroup_type_metrics(orthogroup_types))
         records.append(record)
 
         logger.info(
             f"  res={res:.2f}  K={n_clusters:>5d}  "
             f"P={pairwise['precision']:.4f}  R={pairwise['recall']:.4f}  "
-            f"F1={pairwise['f1']:.4f}  ({elapsed:.1f}s)"
+            f"F1={pairwise['f1']:.4f}  "
+            f"1:1(P/R/F1)={_metric_triplet(record, 'oto')}  "
+            f"n:m(P/R/F1)={_metric_triplet(record, 'ntm')}  "
+            f"({elapsed:.1f}s)"
         )
 
     # ------------------------------------------------------------------
@@ -158,17 +200,21 @@ def main():
     # ------------------------------------------------------------------
     # 5. Print summary table
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 115)
     print(f"  Simple Leiden Results — {organism} (k={k})")
-    print("=" * 70)
-    print(f"  {'Res':>6s}  {'K':>6s}  {'Precision':>10s}  {'Recall':>10s}  {'F1':>10s}")
-    print("  " + "-" * 50)
+    print("=" * 115)
+    print(
+        f"  {'Res':>6s}  {'K':>6s}  {'Precision':>10s}  {'Recall':>10s}  {'F1':>10s}  "
+        f"{'1:1 P/R/F1':>17s}  {'n:m P/R/F1':>17s}"
+    )
+    print("  " + "-" * 110)
     for _, row in df.iterrows():
         print(
             f"  {row['resolution']:6.2f}  {int(row['n_clusters']):6d}  "
-            f"{row['precision']:10.4f}  {row['recall']:10.4f}  {row['f1']:10.4f}"
+            f"{row['precision']:10.4f}  {row['recall']:10.4f}  {row['f1']:10.4f}  "
+            f"{_metric_triplet(row, 'oto'):>17s}  {_metric_triplet(row, 'ntm'):>17s}"
         )
-    print("=" * 70)
+    print("=" * 115)
 
     # ------------------------------------------------------------------
     # 6. Plot Precision & Recall vs Resolution

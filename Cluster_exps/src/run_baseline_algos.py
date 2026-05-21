@@ -19,26 +19,72 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import logging
+from joblib import Parallel, delayed
 
 from pipeline.io import setup_logging, load_embeddings, prepare_embeddings
 from pipeline.evaluation import (
     extract_true_labels,
+    extract_species_labels,
     compute_pairwise_confusion_metrics,
+    compute_orthogroup_type_metrics,
 )
+
+
 from sklearn.preprocessing import StandardScaler
 
 
-def evaluate_labels(true_labels, pred_labels):
-    """Compute pairwise P/R/F1 + cluster stats."""
+def _metric_triplet(row, prefix):
+    """Format compact P/R/F1 output for one orthogroup type."""
+    return (
+        f"{row.get(f'{prefix}_P', 0.0):.3f}/"
+        f"{row.get(f'{prefix}_R', 0.0):.3f}/"
+        f"{row.get(f'{prefix}_F1', 0.0):.3f}"
+    )
+
+
+def _flatten_orthogroup_type_metrics(orthogroup_types):
+    """Flatten 1:1 / 1:m / n:m metrics into CSV-friendly columns."""
+    flattened = {}
+    column_prefixes = {
+        "1:1": "oto",
+        "1:m": "otm",
+        "n:m": "ntm",
+    }
+
+    for metric_name, prefix in column_prefixes.items():
+        values = orthogroup_types.get(metric_name, {})
+        flattened[f"{prefix}_P"] = float(values.get("precision", 0.0))
+        flattened[f"{prefix}_R"] = float(values.get("recall", 0.0))
+        flattened[f"{prefix}_F1"] = float(values.get("f1", 0.0))
+        flattened[f"{prefix}_n_proteins"] = int(values.get("n_proteins", 0))
+        flattened[f"{prefix}_n_groups"] = int(values.get("n_groups", 0))
+
+    return flattened
+
+
+def evaluate_labels(true_labels, pred_labels, prot_meta=None, logger=None):
+    """Compute pairwise P/R/F1, cluster stats, and orthogroup-type metrics."""
     pairwise = compute_pairwise_confusion_metrics(true_labels, pred_labels)
     pred_np = np.asarray(pred_labels)
     n_clusters = len(set(int(l) for l in pred_np if l >= 0))
     n_singletons = int(np.sum(pred_np == -1))
-    return {
+    metrics = {
         **pairwise,
         "n_clusters": n_clusters,
         "n_singletons": n_singletons,
     }
+
+    if prot_meta is not None:
+        species_labels = extract_species_labels(prot_meta)
+        orthogroup_types = compute_orthogroup_type_metrics(
+            true_labels,
+            pred_labels,
+            species_labels,
+            logger=logger,
+        )
+        metrics.update(_flatten_orthogroup_type_metrics(orthogroup_types))
+
+    return metrics
 
 
 
@@ -134,7 +180,54 @@ def run_agglomerative(X, distance_threshold, linkage, n_neighbors, logger):
     logger.info(f"    Done in {elapsed:.1f}s — {n_clusters} clusters")
     return labels, elapsed
 
+def evaluate_hdbscan_config(cfg, X_scaled, true_labels, logger, prot_meta):
+    try:
+        labels, elapsed = run_hdbscan(
+            X_scaled,
+            cfg["min_cluster_size"],
+            cfg["min_samples"],
+            allow_single_cluster=True,
+            logger=logger,
+        )
+        metrics = evaluate_labels(true_labels, labels, prot_meta=prot_meta, logger=logger)
 
+        return {
+            "method": "HDBSCAN",
+            "params": f"mcs={cfg['min_cluster_size']},ms={cfg['min_samples']}",
+            **metrics,
+            "time_s": elapsed,
+        }
+
+    except Exception as e:
+        logger.error(f"HDBSCAN failed with {cfg}: {e}")
+        return None
+
+
+def evaluate_agglo_config(cfg, X_normed, true_labels, logger, prot_meta):
+    try:
+        labels, elapsed = run_agglomerative(
+            X_normed,
+            cfg["distance_threshold"],
+            cfg["linkage"],
+            cfg["n_neighbors"],
+            logger,
+        )
+
+        metrics = evaluate_labels(true_labels, labels, prot_meta=prot_meta, logger=logger)
+
+        return {
+            "method": "Agglomerative",
+            "params": (
+                f"dt={cfg['distance_threshold']:.2f},"
+                f"link={cfg['linkage']},nn={cfg['n_neighbors']}"
+            ),
+            **metrics,
+            "time_s": elapsed,
+        }
+
+    except Exception as e:
+        logger.error(f"Agglomerative failed with {cfg}: {e}")
+        return None
 # =====================================================================
 # Main
 # =====================================================================
@@ -187,47 +280,48 @@ def main():
     # Note: HDBSCAN requires min_cluster_size >= 2 internally.
     # Noise points (label=-1) are treated as singletons in our evaluator.
     hdbscan_configs = [
-        {"min_cluster_size": 2, "min_samples": 1},
-        {"min_cluster_size": 2, "min_samples": 3},
-        {"min_cluster_size": 3, "min_samples": 2},
+        #{"min_cluster_size": 2, "min_samples": 1},
+        #{"min_cluster_size": 2, "min_samples": 3},
+        #{"min_cluster_size": 3, "min_samples": 2},
         {"min_cluster_size": 5, "min_samples": 3},
-        {"min_cluster_size": 5, "min_samples": 5},
-        {"min_cluster_size": 10, "min_samples": 5},
-        {"min_cluster_size": 15, "min_samples": 10},
-        {"min_cluster_size": 20, "min_samples": 10},
+        #{"min_cluster_size": 5, "min_samples": 5},
+        #{"min_cluster_size": 10, "min_samples": 5},
+        #{"min_cluster_size": 15, "min_samples": 10},
+        #{"min_cluster_size": 2, "min_samples": 10},
     ]
 
     logger.info(f"\n{'─'*60}")
     logger.info(f"HDBSCAN  ({len(hdbscan_configs)} configs)")
     logger.info(f"{'─'*60}")
 
-    for cfg in hdbscan_configs:
-        try:
-            labels, elapsed = run_hdbscan(
-                X_scaled, cfg["min_cluster_size"], cfg["min_samples"],
-                allow_single_cluster=True, logger=logger,
-            )
-            metrics = evaluate_labels(true_labels, labels)
-            record = {
-                "method": "HDBSCAN",
-                "params": f"mcs={cfg['min_cluster_size']},ms={cfg['min_samples']}",
-                **metrics,
-                "time_s": elapsed,
-            }
-            all_records.append(record)
-            logger.info(
-                f"    mcs={cfg['min_cluster_size']:>3d} ms={cfg['min_samples']:>3d}  "
-                f"P={metrics['precision']:.4f}  R={metrics['recall']:.4f}  "
-                f"F1={metrics['f1']:.4f}  K={metrics['n_clusters']}  "
-                f"noise={metrics['n_singletons']}"
-            )
-        except Exception as e:
-            logger.error(f"    HDBSCAN failed with {cfg}: {e}")
+    hdbscan_results = Parallel(n_jobs=min(4, os.cpu_count()), backend="loky")(
+        delayed(evaluate_hdbscan_config)(
+            cfg,
+            X_scaled,
+            true_labels,
+            logger,
+            prot_meta
+        )
+        for cfg in hdbscan_configs
+    )
 
+    all_records.extend([r for r in hdbscan_results if r is not None])
+
+    for r in hdbscan_results:
+        if r is not None:
+            logger.info(
+                f"    {r['params']}  "
+                f"P={r['precision']:.4f}  "
+                f"R={r['recall']:.4f}  "
+                f"F1={r['f1']:.4f}  "
+                f"1:1(P/R/F1)={_metric_triplet(r, 'oto')}  "
+                f"n:m(P/R/F1)={_metric_triplet(r, 'ntm')}"
+            )
+    '''
     # ── Agglomerative ──
     agglo_configs = [
-        {"distance_threshold": 0.10, "linkage": "average", "n_neighbors": 40},
-        {"distance_threshold": 0.15, "linkage": "average", "n_neighbors": 40},
+        #{"distance_threshold": 0.10, "linkage": "average", "n_neighbors": 40},
+        #{"distance_threshold": 0.15, "linkage": "average", "n_neighbors": 40},
         {"distance_threshold": 0.20, "linkage": "average", "n_neighbors": 40},
         {"distance_threshold": 0.25, "linkage": "average", "n_neighbors": 40},
         {"distance_threshold": 0.30, "linkage": "average", "n_neighbors": 40},
@@ -237,34 +331,30 @@ def main():
     logger.info(f"AGGLOMERATIVE  ({len(agglo_configs)} configs)")
     logger.info(f"{'─'*60}")
 
-    for cfg in agglo_configs:
-        try:
-            labels, elapsed = run_agglomerative(
-                X_normed,  # use L2-normalised for cosine metric
-                cfg["distance_threshold"],
-                cfg["linkage"],
-                cfg["n_neighbors"],
-                logger,
-            )
-            metrics = evaluate_labels(true_labels, labels)
-            record = {
-                "method": "Agglomerative",
-                "params": (
-                    f"dt={cfg['distance_threshold']:.2f},"
-                    f"link={cfg['linkage']},nn={cfg['n_neighbors']}"
-                ),
-                **metrics,
-                "time_s": elapsed,
-            }
-            all_records.append(record)
-            logger.info(
-                f"    dt={cfg['distance_threshold']:.2f} link={cfg['linkage']}  "
-                f"P={metrics['precision']:.4f}  R={metrics['recall']:.4f}  "
-                f"F1={metrics['f1']:.4f}  K={metrics['n_clusters']}"
-            )
-        except Exception as e:
-            logger.error(f"    Agglomerative failed with {cfg}: {e}")
+    agglo_results = Parallel(n_jobs = min(4, os.cpu_count()), backend="loky")(
+        delayed(evaluate_agglo_config)(
+            cfg,
+            X_normed,
+            true_labels,
+            logger,
+            prot_meta,
+        )
+        for cfg in agglo_configs
+    )
 
+    all_records.extend([r for r in agglo_results if r is not None])
+
+    for r in agglo_results:
+        if r is not None:
+            logger.info(
+                f"    {r['params']}  "
+                f"P={r['precision']:.4f}  "
+                f"R={r['recall']:.4f}  "
+                f"F1={r['f1']:.4f}  "
+                f"1:1(P/R/F1)={_metric_triplet(r, 'oto')}  "
+                f"n:m(P/R/F1)={_metric_triplet(r, 'ntm')}"
+            )
+    '''
     # ------------------------------------------------------------------
     # 3. Save CSV
     # ------------------------------------------------------------------
@@ -281,14 +371,17 @@ def main():
     print("=" * 90)
     print(
         f"  {'Method':<15s}  {'Params':<30s}  "
-        f"{'K':>6s}  {'Precision':>10s}  {'Recall':>10s}  {'F1':>10s}  {'Time':>6s}"
+        f"{'K':>6s}  {'Precision':>10s}  {'Recall':>10s}  {'F1':>10s}  "
+        f"{'1:1 P/R/F1':>17s}  {'n:m P/R/F1':>17s}  {'Time':>6s}"
     )
-    print("  " + "-" * 85)
+    print("  " + "-" * 125)
     for _, row in df.iterrows():
         print(
             f"  {row['method']:<15s}  {row['params']:<30s}  "
             f"{int(row['n_clusters']):6d}  {row['precision']:10.4f}  "
-            f"{row['recall']:10.4f}  {row['f1']:10.4f}  {row['time_s']:5.1f}s"
+            f"{row['recall']:10.4f}  {row['f1']:10.4f}  "
+            f"{_metric_triplet(row, 'oto'):>17s}  {_metric_triplet(row, 'ntm'):>17s}  "
+            f"{row['time_s']:5.1f}s"
         )
     print("=" * 90)
 
@@ -300,7 +393,9 @@ def main():
             best = sub.loc[sub["f1"].idxmax()]
             print(
                 f"  {method:<15s}  {best['params']:<30s}  "
-                f"P={best['precision']:.4f}  R={best['recall']:.4f}  F1={best['f1']:.4f}"
+                f"P={best['precision']:.4f}  R={best['recall']:.4f}  F1={best['f1']:.4f}  "
+                f"1:1(P/R/F1)={_metric_triplet(best, 'oto')}  "
+                f"n:m(P/R/F1)={_metric_triplet(best, 'ntm')}"
             )
 
     # ------------------------------------------------------------------
