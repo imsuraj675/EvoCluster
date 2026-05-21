@@ -9,10 +9,11 @@ def relabel_contiguous(labels: np.ndarray):
     """Map labels >= 0 to 0..K-1, keep -1 as -1."""
     labels = labels.copy()
     kept = np.unique(labels[labels >= 0])
-    remap = {old: new for new, old in enumerate(kept.tolist())}
-    for i in range(labels.size):
-        if labels[i] >= 0:
-            labels[i] = remap[labels[i]]
+    if kept.size == 0:
+        return labels, kept
+    # Vectorized remapping via searchsorted (kept is already sorted from np.unique)
+    mask = labels >= 0
+    labels[mask] = np.searchsorted(kept, labels[mask]).astype(labels.dtype)
     return labels, kept
 
 
@@ -203,30 +204,6 @@ def compute_orthogroup_type_metrics(true_labels, pred_labels, species_labels, lo
     return results
 
 
-def compute_per_species_diagnostics(pred_labels, prot_meta, logger=None):
-    """Compute per-species assignment rates to diagnose species-specific recall failures."""
-    log = logger or logging.getLogger("multiscale")
-    species = extract_species_labels(prot_meta)
-    pred_labels = np.asarray(pred_labels)
-    results = {}
-    for sp in sorted(set(species.tolist())):
-        mask = species == sp
-        total = int(mask.sum())
-        assigned = int(np.sum(pred_labels[mask] >= 0))
-        results[sp] = {
-            "total": total,
-            "assigned": assigned,
-            "unassigned": total - assigned,
-            "singleton_rate": (total - assigned) / max(total, 1),
-        }
-        log.info(
-            f"  [{sp}] {assigned}/{total} assigned "
-            f"({100 * assigned / max(total, 1):.1f}%), "
-            f"{total - assigned} singletons"
-        )
-    return results
-
-
 def evaluate_run(labels, prot_meta):
     """Primary evaluation: pairwise precision/recall/F1 + AMI + V-measure."""
     true_labels = extract_true_labels(prot_meta)
@@ -245,7 +222,7 @@ def evaluate_run(labels, prot_meta):
     }
 
 
-def evaluate_clustering(labels, prot_meta, *, graph=None, level_name="", extended_eval=False, logger=None):
+def evaluate_clustering(labels, prot_meta, *, level_name="", logger=None):
     """Evaluate clustering against true orthogroup labels."""
     log = logger or logging.getLogger("multiscale")
 
@@ -265,26 +242,7 @@ def evaluate_clustering(labels, prot_meta, *, graph=None, level_name="", extende
         f"FN={pairwise['FN']}  TN={pairwise['TN']}"
     )
 
-    if graph is not None:
-        try:
-            from .evaluation_cdlib import evaluate_topology_cdlib
-
-            cdlib_metrics = evaluate_topology_cdlib(graph, labels, logger=log)
-            if cdlib_metrics:
-                metrics.update(cdlib_metrics)
-                mod = cdlib_metrics.get("modularity", float("nan"))
-                cond = cdlib_metrics.get("conductance", float("nan"))
-                log.info(
-                    f"  AMI={metrics['AMI']:.4f}  PairwiseF1={pairwise['f1']:.4f} | "
-                    f"Modularity={mod:.4f} Conductance={cond:.4f}"
-                )
-            else:
-                log.info(f"  AMI={metrics['AMI']:.4f}  PairwiseF1={pairwise['f1']:.4f}")
-        except Exception as e:
-            log.debug(f"Topological metric integration failed: {e}")
-            log.info(f"  AMI={metrics['AMI']:.4f}  PairwiseF1={pairwise['f1']:.4f}")
-    else:
-        log.info(f"  AMI={metrics['AMI']:.4f}  PairwiseF1={pairwise['f1']:.4f}")
+    log.info(f"  AMI={metrics['AMI']:.4f}  PairwiseF1={pairwise['f1']:.4f}")
     log.info(
         f"  V-measure={metrics['v_measure']:.4f}  "
         f"Homogeneity={metrics['homogeneity']:.4f}  "
@@ -302,44 +260,6 @@ def evaluate_clustering(labels, prot_meta, *, graph=None, level_name="", extende
     except Exception as e:
         log.debug(f"Orthogroup type metrics failed: {e}")
 
-    # ── Per-species singleton diagnostics (always-on) ──
-    try:
-        sp_diag = compute_per_species_diagnostics(labels, prot_meta, logger=log)
-        metrics["species_diagnostics"] = sp_diag
-    except Exception as e:
-        log.debug(f"Per-species diagnostics failed: {e}")
-
-    # ── Extended evaluation ──
-    if extended_eval:
-        try:
-            from .evaluation_extended import run_extended_evaluation
-            true_labels = extract_true_labels(prot_meta)
-            ext = run_extended_evaluation(true_labels, labels, logger=log)
-            metrics["extended"] = ext
-
-            # Log headline extended metrics
-            bcubed = ext.get("bcubed", {})
-            sm = ext.get("split_merge", {})
-            log.info(
-                f"  B-cubed  P={bcubed.get('bcubed_precision', 0):.3f}  "
-                f"R={bcubed.get('bcubed_recall', 0):.3f}  "
-                f"F1={bcubed.get('bcubed_f1', 0):.3f}"
-            )
-            log.info(
-                f"  Split/Merge: {sm.get('n_split_groups', 0)} groups split, "
-                f"{sm.get('n_merge_clusters', 0)} clusters impure"
-            )
-
-            # Log size-binned summary
-            size_bins = ext.get("size_binned", {})
-            for bin_name, bm in size_bins.items():
-                if bm.get("n_proteins", 0) > 0:
-                    log.info(
-                        f"  [{bin_name}] P={bm['precision']:.3f} R={bm['recall']:.3f} "
-                        f"F1={bm['f1']:.3f} ({bm['n_proteins']} prots, {bm['n_groups']} groups)"
-                    )
-        except Exception as e:
-            log.debug(f"Extended evaluation failed: {e}")
 
     metrics["primary_score"] = pairwise["f1"]
     metrics["combined_score"] = pairwise["f1"]

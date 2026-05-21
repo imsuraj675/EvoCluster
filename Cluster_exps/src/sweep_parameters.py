@@ -76,7 +76,7 @@ def plot_nested_results(all_studies_data, organism):
         print(f"[+] Saved P-R tradeoff plot to: {pr_img}")
 
 
-def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, graph_type, diffusion_alpha=0.0):
+def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, graph_type):
     # Setup isolated logger for parallel process output safety
     logger_name = f"{organism}_sweep_{graph_type}_k{k_coeff}"
     logger = setup_logging(logger_name)
@@ -99,13 +99,6 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, gr
             rescue_edges=True, rescue_cos_threshold=0.92, logger=logger
         )
 
-    # Compute diffusion if alpha > 0
-    diffusion_X_alpha = None
-    if diffusion_alpha > 0:
-        from pipeline.diffusion import compute_diffused_embeddings
-        diffusion_X_alpha, _ = compute_diffused_embeddings(
-            X_pca, snn["adjacency"], alpha=diffusion_alpha, logger=logger
-        )
 
     # Use profile discovery by default as requested
     ms_result = run_resolution_profile_discovery(
@@ -119,7 +112,7 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, gr
 
     stability = score_and_select_scales(
         hierarchy, ms_result, snn, 
-        selection_policy="best_composite", consensus_runs=5, seed=0, logger=logger
+        consensus_runs=5, seed=0, logger=logger
     )
     
     logger.info(f"[*] Base Graph & Profile Pipeline Constructed in {time.time() - t_graph:.1f}s.")
@@ -138,22 +131,16 @@ def optimize_for_k(k_coeff, organism, n_inner_trials, X, X_pca, N, prot_meta, gr
                 X_pca, snn, hierarchy, stability, ms_result,
                 centroid_cos_threshold=centroid_cos,
                 edge_connectivity_threshold=edge_conn,
-                output_level="fine",
                 k_neighbors=k,
                 homology_rescue=True,
                 homology_rescue_cos=homology_cos,
-                cross_branch_rescue=False,
-                diffusion_alpha=diffusion_alpha,
-                diffusion_X_alpha=diffusion_X_alpha,
                 logger=logger,
             )
             
             metrics = evaluate_clustering(
                 refined["labels_all"]["fine"], 
                 prot_meta,
-                graph=None, 
                 level_name="fine", 
-                extended_eval=False, 
                 logger=logger
             )
             f1 = metrics["primary_score"]
@@ -201,7 +188,7 @@ def main():
     parser.add_argument("--graph_type", type=str, default="snn", choices=["snn", "knn"], help="Graph architecture (snn or knn)")
     parser.add_argument("--inner_trials", type=int, default=30, help="Number of fast merge trials per k_coeff graph")
     parser.add_argument("--n_jobs", type=int, default=4, help="Number of outer loop graphs to construct in parallel")
-    parser.add_argument("--diffusion_alpha", type=float, default=0.0, help="SGC diffusion alpha (0=disabled)")
+
     args = parser.parse_args()
 
     organism = args.organism
@@ -239,7 +226,7 @@ def main():
     main_logger.info(f"Dispatching outer loops to {args.n_jobs} parallel cores. Check sub-logs for specific progress!")
     
     all_studies_data = Parallel(n_jobs=args.n_jobs)(
-        delayed(optimize_for_k)(k_coeff, organism, args.inner_trials, X, X_pca, N, prot_meta, args.graph_type, args.diffusion_alpha) 
+        delayed(optimize_for_k)(k_coeff, organism, args.inner_trials, X, X_pca, N, prot_meta, args.graph_type) 
         for k_coeff in k_coeffs
     )
 

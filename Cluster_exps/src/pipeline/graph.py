@@ -1,5 +1,4 @@
 import math
-import time
 import logging
 import numpy as np
 import torch
@@ -49,15 +48,18 @@ def build_candidate_neighbors(X, *, k_candidates, use_faiss=True, use_gpu=False,
         scores = 1.0 - dists
         backend_used = "sklearn NearestNeighbors"
     log.info(f"  Backend: {backend_used}")
+    # Pre-compute valid mask: exclude self-loops and invalid indices
+    self_idx = np.arange(N).reshape(-1, 1)
+    valid_mask = (indices >= 0) & (indices != self_idx)
+
     nbr_indices = []
     nbr_scores = []
     for i in range(N):
-        js = indices[i]
-        vs = scores[i]
-        keep = [(int(j), float(v)) for j, v in zip(js, vs) if j >= 0 and j != i]
-        keep = keep[:k_candidates]
-        nbr_indices.append([j for j, _ in keep])
-        nbr_scores.append([v for _, v in keep])
+        vi = valid_mask[i]
+        js = indices[i, vi][:k_candidates]
+        vs = scores[i, vi][:k_candidates]
+        nbr_indices.append(js.tolist())
+        nbr_scores.append(vs.tolist())
     neighbor_sets = [set(row) for row in nbr_indices]
     total_edges = sum(len(row) for row in nbr_indices)
     log.info(f"  Found {total_edges} directed neighbor links")
@@ -222,7 +224,7 @@ def build_snn_graph(
             if i not in neighbor_sets[j]:
                 continue
             intersection = len(neighbor_sets[i] & neighbor_sets[j])
-            union = len(neighbor_sets[i] | neighbor_sets[j])
+            union = len(neighbor_sets[i]) + len(neighbor_sets[j]) - intersection
             if union == 0:
                 continue
             jaccard = intersection / union
@@ -303,73 +305,4 @@ def build_snn_graph(
         },
     }
 
-def run_phate_scale_discovery(X_pca, *, n_jobs=-1, random_state=0, logger=None):
-    log = logger or logging.getLogger("multiscale")
-    log.info("Step 2c: Running Multiscale PHATE scale discovery")
-    t0 = time.time()
-    try:
-        import multiscale_phate as mphate
-    except ImportError:
-        raise ImportError("multiscale-phate is required when --use_phate is set")
-    mp = mphate.Multiscale_PHATE(n_pca=None, n_jobs=n_jobs, random_state=random_state)
-    mp.fit(X_pca)
-    levels = mp.levels
-    gradient = mp.gradient
-    NxTs = mp.NxTs
-    cluster_counts = []
-    for lev in levels:
-        n_clusters = len(set(NxTs[lev]))
-        cluster_counts.append(n_clusters)
-    elapsed = time.time() - t0
-    log.info(f"  PHATE found {len(levels)} stable levels in {elapsed:.1f}s")
-    for i, (lev, kc) in enumerate(zip(levels, cluster_counts)):
-        log.info(f"    level {i}: condensation_iter={lev}, K={kc}")
-    if len(levels) < 2:
-        log.warning("  ⚠ PHATE found fewer than 2 stable levels.")
-    if len(levels) > 10:
-        log.info(f"  ℹ PHATE found {len(levels)} levels — will use top 6-8 by spread.")
-    return {
-        "levels": levels,
-        "gradient": gradient,
-        "cluster_counts": cluster_counts,
-        "NxTs": NxTs,
-        "elapsed": elapsed,
-    }
 
-def map_phate_to_leiden_resolutions(
-    snn_graph, target_counts, *,
-    objective="CPM",
-    search_lo=1e-4, search_hi=5.0,
-    tolerance=0.20,
-    max_iter=25,
-    logger=None,
-):
-    from .leiden import _leiden_cluster_count
-    log = logger or logging.getLogger("multiscale")
-    log.info(f"Step 2d: Mapping {len(target_counts)} PHATE levels → Leiden resolutions")
-    g = snn_graph["graph"]
-    found_resolutions = []
-    for target_k in sorted(set(target_counts), reverse=True):
-        lo, hi = search_lo, search_hi
-        best_r, best_diff = (lo + hi) / 2, float("inf")
-        for _ in range(max_iter):
-            mid = (lo + hi) / 2
-            k = _leiden_cluster_count(g, mid, objective)
-            diff = abs(k - target_k) / max(target_k, 1)
-            if diff < best_diff:
-                best_diff = diff
-                best_r = mid
-            if diff <= tolerance:
-                break
-            if k < target_k:
-                lo = mid
-            else:
-                hi = mid
-        found_resolutions.append(best_r)
-        log.debug(f"    target K={target_k} → res={best_r:.6f} (got K within {best_diff*100:.0f}%)")
-    derived = sorted(set(round(r, 6) for r in found_resolutions))
-    if len(derived) < 2:
-        log.warning("  ⚠ PHATE mapping produced <2 distinct resolutions, adding boundary values.")
-        derived = sorted(set(derived + [search_lo, (search_lo + search_hi) / 10]))
-    log.info(f"  Derived resolution grid ({len(derived)} values): {[f'{r:.4f}' for r in derived]}")
-    return derived

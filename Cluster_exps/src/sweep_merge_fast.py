@@ -10,7 +10,8 @@ import matplotlib.pyplot as plt
 # Import the core pipeline components directly
 from pipeline.io import setup_logging, log_device_info, load_embeddings, prepare_embeddings
 from pipeline.graph import compute_adaptive_k, build_candidate_neighbors, build_snn_graph
-from pipeline.leiden import run_leiden_multiscale, build_cluster_hierarchy
+from pipeline.leiden import build_cluster_hierarchy
+from pipeline.discovery import run_resolution_profile_discovery
 from pipeline.selection import score_and_select_scales
 from pipeline.merge import refine_and_flatten
 from pipeline.evaluation import get_ground_truth_stats, evaluate_clustering
@@ -69,7 +70,6 @@ def main():
     parser.add_argument("organism", type=str, help="Dataset organism code (e.g. pfal_pber)")
     parser.add_argument("--n_trials", type=int, default=50, help="Number of merge trials to run")
     parser.add_argument("--k_coeff", type=float, default=0.6, help="Fixed k_coeff for the graph base")
-    parser.add_argument("--diffusion_alpha", type=float, default=0.0, help="SGC diffusion alpha (0=disabled)")
     args = parser.parse_args()
 
     organism = args.organism
@@ -105,27 +105,19 @@ def main():
         rescue_edges=True, rescue_cos_threshold=0.92, logger=logger
     )
 
-    # 3. Leiden Sweeps (using manual mode for speed, avoiding PyGen)
-    ms_result = run_leiden_multiscale(
-        snn, resolution_grid=None, objective_function="CPM", seed=0, logger=logger
+    # 3. Resolution Profile Discovery
+    ms_result = run_resolution_profile_discovery(
+        snn, objective_function="CPM", per_component=True, min_component_size=50, logger=logger
     )
     hierarchy = build_cluster_hierarchy(ms_result, logger=logger)
 
     # 4. Score and Select Scales
     stability = score_and_select_scales(
         hierarchy, ms_result, snn,
-        selection_policy="best_composite", consensus_runs=5, seed=0, logger=logger
+        consensus_runs=5, seed=0, logger=logger
     )
     
     logger.info(f"\n[+] ONE-TIME EXPENSIVE SETUP COMPLETED IN {time.time() - t0_setup:.1f} SECONDS.")
-
-    # Compute diffusion if enabled
-    diffusion_X_alpha = None
-    if args.diffusion_alpha > 0:
-        from pipeline.diffusion import compute_diffused_embeddings
-        diffusion_X_alpha, _ = compute_diffused_embeddings(
-            X_pca, snn["adjacency"], alpha=args.diffusion_alpha, logger=logger
-        )
 
     logger.info("[+] COMMENCING HIGH-SPEED OPTUNA MERGE SWEEP...\n")
 
@@ -150,13 +142,9 @@ def main():
                 X_pca, snn, hierarchy, stability, ms_result,
                 centroid_cos_threshold=centroid_cos,
                 edge_connectivity_threshold=edge_conn,
-                output_level="fine",
                 k_neighbors=k,
                 homology_rescue=True,
                 homology_rescue_cos=homology_cos,
-                cross_branch_rescue=False,
-                diffusion_alpha=args.diffusion_alpha,
-                diffusion_X_alpha=diffusion_X_alpha,
                 logger=logger,
             )
 
@@ -164,9 +152,7 @@ def main():
             metrics = evaluate_clustering(
                 refined["labels_all"]["fine"],
                 prot_meta,
-                graph=None, 
                 level_name="fine",
-                extended_eval=False,
                 logger=logger,
             )
             

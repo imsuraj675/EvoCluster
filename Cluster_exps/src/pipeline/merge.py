@@ -16,18 +16,10 @@ def refine_and_flatten(
     centroid_cos_threshold=0.85,
     edge_connectivity_threshold=0.05,
     edge_strong_threshold=None,
-    protect_singletons=True,
-    output_level="adaptive",
     k_neighbors=None,
     homology_rescue=False,
     homology_rescue_cos=0.95,
     homology_rescue_max_size=20,
-    cross_branch_rescue=False,
-    cross_branch_cos=0.93,
-    cross_branch_edge=0.03,
-    max_cross_branch_merges=500,
-    diffusion_alpha=0.0,
-    diffusion_X_alpha=None,
     logger=None,
 ):
     from .evaluation import relabel_contiguous
@@ -48,11 +40,6 @@ def refine_and_flatten(
     log.info(f"  Base thresholds — cos: {centroid_cos_threshold}, edge: {edge_connectivity_threshold}, strong: {edge_strong_threshold}")
     log.info(f"  Graph-aware normalization — k={k}")
     log.info(f"  Homology rescue: {homology_rescue} (cos>={homology_rescue_cos}, max_size<={homology_rescue_max_size})")
-    log.info(f"  Cross-branch rescue: {cross_branch_rescue} (cos>={cross_branch_cos}, edge>={cross_branch_edge}, max={max_cross_branch_merges})")
-    if diffusion_alpha > 0 and diffusion_X_alpha is not None:
-        log.info(f"  SGC diffusion: alpha={diffusion_alpha:.2f} (applied in final cascade stage only)")
-    else:
-        log.info(f"  SGC diffusion: disabled")
 
     adj_csr = adjacency.tocsr() if not hasattr(adjacency, 'indptr') else adjacency
 
@@ -63,7 +50,7 @@ def refine_and_flatten(
         single_labels = np.full(N, -1, dtype=np.int32)
         return {
             "labels": single_labels,
-            "labels_all": {"coarse": single_labels, "fine": single_labels, "adaptive": single_labels},
+            "labels_all": {"fine": single_labels},
             "n_clusters": 0,
             "n_singletons": N,
             "merge_log": [],
@@ -77,7 +64,7 @@ def refine_and_flatten(
         single_out, _ = relabel_contiguous(single_labels)
         return {
             "labels": single_out,
-            "labels_all": {"coarse": single_out, "fine": single_out, "adaptive": single_out},
+            "labels_all": {"fine": single_out},
             "n_clusters": len(set(single_out[single_out >= 0].tolist())),
             "n_singletons": int(np.sum(single_out == -1)),
             "merge_log": [],
@@ -135,12 +122,7 @@ def refine_and_flatten(
         log.info(f"  ── Stage {s_idx+1}: guide=L{guide_idx} (K={guide_K}) → fine=L{fine_idx} (K={fine_K})")
 
         is_final_stage = (s_idx == n_stages - 1)
-        use_diffused = (
-            is_final_stage
-            and diffusion_alpha > 0
-            and diffusion_X_alpha is not None
-        )
-        X_centroids = diffusion_X_alpha if use_diffused else X
+        X_centroids = X
 
         stage_result = _cascade_merge_stage(
             X=X,
@@ -188,81 +170,8 @@ def refine_and_flatten(
             "strong_threshold": thresholds["strong"],
         })
 
-    coarse_level_idx = selected[0]
-    if coarse_level_idx in merged_labels:
-        coarse_out, _ = relabel_contiguous(merged_labels[coarse_level_idx])
-    else:
-        coarse_out, _ = relabel_contiguous(levels[coarse_level_idx]["labels"].copy())
-
     fine_level_idx = selected[-1]
     fine_out, _ = relabel_contiguous(merged_labels[fine_level_idx])
-
-    if n_stages >= 2:
-        mid_idx = selected[len(selected) // 2]
-        if mid_idx in merged_labels:
-            mid_out, _ = relabel_contiguous(merged_labels[mid_idx])
-        else:
-            mid_out, _ = relabel_contiguous(levels[mid_idx]["labels"].copy())
-    else:
-        mid_out = fine_out.copy()
-
-    # ── Cross-branch rescue pass ──
-    n_cross_branch_merges = 0
-    if cross_branch_rescue:
-        # Use diffused embeddings for cross-branch centroids if available
-        cb_X_centroids = diffusion_X_alpha if (diffusion_alpha > 0 and diffusion_X_alpha is not None) else X
-        cb_result = _cross_branch_rescue(
-            X=cb_X_centroids,
-            fine_labels=fine_out,
-            coarse_labels=coarse_out,
-            adj_csr=adj_csr,
-            k=k,
-            cross_branch_cos=cross_branch_cos,
-            cross_branch_edge=cross_branch_edge,
-            max_merges=max_cross_branch_merges,
-            logger=log,
-        )
-        fine_out = cb_result["labels"]
-        fine_out, _ = relabel_contiguous(fine_out)
-        n_cross_branch_merges = cb_result["n_merges"]
-        total_merges += n_cross_branch_merges
-        all_merge_log.extend(cb_result["merge_log"])
-        log.info(f"  Cross-branch rescue: {n_cross_branch_merges} merges performed")
-
-    g = snn_graph_result["graph"]
-    adaptive_out = fine_out.copy()
-    max_fine_id = adaptive_out.max() if adaptive_out.size > 0 else 0
-    for coarse_cid in set(coarse_out[coarse_out >= 0].tolist()):
-        coarse_mask = coarse_out == coarse_cid
-        coarse_members = np.where(coarse_mask)[0]
-        fine_ids_here = set(fine_out[coarse_mask][fine_out[coarse_mask] >= 0].tolist())
-
-        if len(fine_ids_here) <= 1:
-            continue
-
-        if len(coarse_members) >= 2:
-            sg_c = g.subgraph(coarse_members.tolist())
-            possible_c = len(coarse_members) * (len(coarse_members) - 1) / 2
-            density_c = sg_c.ecount() / possible_c if possible_c > 0 else 0.0
-        else:
-            density_c = 0.0
-
-        fine_densities = []
-        for fid in fine_ids_here:
-            fm = np.where(fine_out == fid)[0]
-            if len(fm) >= 2:
-                sg_f = g.subgraph(fm.tolist())
-                possible_f = len(fm) * (len(fm) - 1) / 2
-                fine_densities.append(sg_f.ecount() / possible_f if possible_f > 0 else 0.0)
-            else:
-                fine_densities.append(0.0)
-        density_f = float(np.mean(fine_densities)) if fine_densities else 0.0
-
-        if density_c > density_f:
-            for node in coarse_members:
-                adaptive_out[node] = coarse_cid + max_fine_id + 1
-
-    adaptive_out, _ = relabel_contiguous(adaptive_out)
 
     n_clusters_fine = len(set(fine_out[fine_out >= 0].tolist()))
     n_singletons = int(np.sum(fine_out == -1))
@@ -270,9 +179,7 @@ def refine_and_flatten(
     log.info(f"  Total merge candidates evaluated: {total_merges + total_rejected}")
     log.info(f"  Total merges performed: {total_merges} (rejected: {total_rejected})")
     log.info(f"  Homology rescues: {total_homology_rescues}")
-    log.info(f"  Cross-branch rescues: {n_cross_branch_merges}")
     log.info(f"  Final clusters (fine/merged): {n_clusters_fine} (+{n_singletons} singletons)")
-    log.info(f"  Output level: {output_level}")
 
     if total_merges > 0 and total_rejected == 0:
         log.warning(f"  ⚠ ALL merge candidates were accepted (0 rejections).")
@@ -281,14 +188,8 @@ def refine_and_flatten(
         merge_pct = 100 * total_merges / max(total_input_clusters, 1)
         log.warning(f"  ⚠ HIGH MERGE RATE: {total_merges} merges ({merge_pct:.0f}% of input clusters).")
 
-    labels_all = {
-        "coarse": coarse_out,
-        "fine": fine_out,
-        "mid": mid_out,
-        "adaptive": adaptive_out,
-    }
-
-    primary = labels_all.get(output_level, adaptive_out)
+    primary = fine_out
+    labels_all = {"fine": primary}
 
     return {
         "labels": primary,
@@ -301,151 +202,7 @@ def refine_and_flatten(
     }
 
 
-# ---------------------------------------------------------------------------
-#  Cross-branch rescue
-# ---------------------------------------------------------------------------
 
-def _cross_branch_rescue(
-    X, fine_labels, coarse_labels, adj_csr, k,
-    cross_branch_cos, cross_branch_edge, max_merges, logger=None,
-):
-    """
-    After branch-local cascaded merge, attempt a single global pass that
-    allows merges across coarse-level branch boundaries when both cosine
-    similarity and edge connectivity evidence is strong.
-
-    Only pairs whose coarse parents share a common grandparent (if available)
-    or are direct coarse neighbors are considered.
-    """
-    log = logger or logging.getLogger("multiscale")
-    log.info("  ── Cross-branch rescue pass ──")
-
-    merged = fine_labels.copy()
-    merge_log = []
-    n_merges = 0
-
-    # Build cluster info
-    cluster_info = {}
-    for fid in set(merged[merged >= 0].tolist()):
-        members = np.where(merged == fid)[0]
-        cluster_info[fid] = {
-            "members": set(members.tolist()),
-            "sum": X[members].sum(axis=0),
-            "count": len(members),
-        }
-
-    # Build cross-edge counts and neighbor map
-    node_to_cluster = {}
-    for fid, info in cluster_info.items():
-        for node in info["members"]:
-            node_to_cluster[node] = fid
-
-    cross_edges = defaultdict(int)
-    cluster_neighbors = defaultdict(set)
-
-    for node_i in range(adj_csr.shape[0]):
-        ci = node_to_cluster.get(node_i, -1)
-        if ci < 0:
-            continue
-        row_start = adj_csr.indptr[node_i]
-        row_end = adj_csr.indptr[node_i + 1]
-        for idx in range(row_start, row_end):
-            node_j = adj_csr.indices[idx]
-            cj = node_to_cluster.get(node_j, -1)
-            if cj < 0 or ci == cj:
-                continue
-            key = (min(ci, cj), max(ci, cj))
-            cross_edges[key] += 1
-            cluster_neighbors[ci].add(cj)
-            cluster_neighbors[cj].add(ci)
-
-    for key in cross_edges:
-        cross_edges[key] //= 2
-
-    # Build coarse branch mapping: fine_cluster -> coarse_cluster
-    fine_to_coarse = {}
-    for fid in cluster_info:
-        members = list(cluster_info[fid]["members"])
-        if members:
-            coarse_votes = coarse_labels[members]
-            coarse_votes = coarse_votes[coarse_votes >= 0]
-            if len(coarse_votes) > 0:
-                fine_to_coarse[fid] = int(np.argmax(np.bincount(coarse_votes)))
-
-    # Score all cross-branch pairs
-    candidates = []
-    seen_pairs = set()
-
-    for fi in list(cluster_info.keys()):
-        coarse_fi = fine_to_coarse.get(fi, -1)
-        for fj in cluster_neighbors.get(fi, set()):
-            if fj <= fi:
-                continue
-            pair = (fi, fj)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-
-            coarse_fj = fine_to_coarse.get(fj, -1)
-            # Only consider CROSS-branch pairs
-            if coarse_fi == coarse_fj and coarse_fi >= 0:
-                continue
-
-            # Cosine similarity
-            ci_vec = cluster_info[fi]["sum"] / max(cluster_info[fi]["count"], 1)
-            cj_vec = cluster_info[fj]["sum"] / max(cluster_info[fj]["count"], 1)
-            ni, nj = np.linalg.norm(ci_vec), np.linalg.norm(cj_vec)
-            cos_sim = float(np.dot(ci_vec, cj_vec) / (ni * nj + EPS))
-
-            # Edge connectivity
-            key = (min(fi, fj), max(fi, fj))
-            n_cross = cross_edges.get(key, 0)
-            min_size = min(cluster_info[fi]["count"], cluster_info[fj]["count"])
-            denom = min_size * k if k > 0 else min_size
-            edge_conn = n_cross / denom if denom > 0 else 0.0
-
-            if cos_sim >= cross_branch_cos and edge_conn >= cross_branch_edge:
-                score = 0.7 * edge_conn + 0.3 * cos_sim
-                candidates.append((score, fi, fj, cos_sim, edge_conn))
-
-    # Sort by score descending, merge top candidates
-    candidates.sort(key=lambda x: -x[0])
-    cluster_version = {fid: 0 for fid in cluster_info}
-
-    for score, fi, fj, cos_sim, edge_conn in candidates:
-        if n_merges >= max_merges:
-            break
-        if fi not in cluster_info or fj not in cluster_info:
-            continue
-
-        # Merge fj into fi
-        info_i = cluster_info[fi]
-        info_j = cluster_info.pop(fj)
-
-        info_i["members"].update(info_j["members"])
-        info_i["sum"] = info_i["sum"] + info_j["sum"]
-        info_i["count"] += info_j["count"]
-
-        for node in info_j["members"]:
-            node_to_cluster[node] = fi
-            merged[node] = fi
-
-        merge_log.append({
-            "child_a": int(fi), "child_b": int(fj),
-            "centroid_sim": cos_sim, "edge_connectivity": edge_conn,
-            "merged": True,
-            "reason": f"cross_branch cos={cos_sim:.3f}>={cross_branch_cos}, edge={edge_conn:.3f}>={cross_branch_edge}",
-            "merge_source": "cross_branch",
-        })
-        n_merges += 1
-
-    log.info(f"    Cross-branch candidates: {len(candidates)}, merges: {n_merges}")
-
-    return {
-        "labels": merged,
-        "n_merges": n_merges,
-        "merge_log": merge_log,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -485,26 +242,28 @@ def _cascade_merge_stage(
     cross_edges = defaultdict(int)
     cluster_neighbors = defaultdict(set)
 
+    # Build node→cluster lookup (dict for merge ops, array for vectorized scan)
+    node_to_cluster_arr = np.full(adj_csr.shape[0], -1, dtype=np.int64)
     node_to_cluster = {}
     for fid, info in cluster_info.items():
         for node in info["members"]:
             node_to_cluster[node] = fid
+            node_to_cluster_arr[node] = fid
 
-    for node_i in range(adj_csr.shape[0]):
-        ci = node_to_cluster.get(node_i, -1)
-        if ci < 0:
-            continue
-        row_start = adj_csr.indptr[node_i]
-        row_end = adj_csr.indptr[node_i + 1]
-        for idx in range(row_start, row_end):
-            node_j = adj_csr.indices[idx]
-            cj = node_to_cluster.get(node_j, -1)
-            if cj < 0 or ci == cj:
-                continue
-            key = (min(ci, cj), max(ci, cj))
-            cross_edges[key] += 1
-            cluster_neighbors[ci].add(cj)
-            cluster_neighbors[cj].add(ci)
+    # Vectorized cross-edge computation via COO representation
+    coo = adj_csr.tocoo()
+    ci_arr = node_to_cluster_arr[coo.row]
+    cj_arr = node_to_cluster_arr[coo.col]
+    # Filter to cross-cluster edges (both assigned, different clusters)
+    cross_mask = (ci_arr >= 0) & (cj_arr >= 0) & (ci_arr != cj_arr)
+    ci_cross = ci_arr[cross_mask]
+    cj_cross = cj_arr[cross_mask]
+
+    for ci_val, cj_val in zip(ci_cross.tolist(), cj_cross.tolist()):
+        key = (min(ci_val, cj_val), max(ci_val, cj_val))
+        cross_edges[key] += 1
+        cluster_neighbors[ci_val].add(cj_val)
+        cluster_neighbors[cj_val].add(ci_val)
 
     for key in cross_edges:
         cross_edges[key] //= 2

@@ -21,38 +21,36 @@ def _is_feasible(n_clusters, n_singletons, N, logger=None):
         return False, f"K={n_clusters} > 0.8*N={int(0.8*N)} (trivial partition)"
     return True, "ok"
 
-def _compute_mean_conductance(labels, g, cluster_ids):
-    """Compute size-weighted mean conductance across clusters."""
-    total_vol = 2 * g.ecount()
-    if total_vol == 0:
+def _compute_mean_conductance_fast(labels, cluster_ids, sizes_arr, internal_counts,
+                                    degrees, total_vol):
+    """Compute size-weighted mean conductance without per-cluster subgraph extraction.
+
+    Uses pre-computed internal edge counts and degree array so the cost is
+    O(N) instead of O(K * (N + E)).
+    """
+    if total_vol == 0 or len(cluster_ids) == 0:
         return 0.0
 
-    conductances = []
-    sizes = []
-    for cid in cluster_ids:
-        members = np.where(labels == cid)[0]
-        n_members = len(members)
-        if n_members < 1:
-            continue
+    max_cid = int(cluster_ids.max())
 
-        subgraph = g.subgraph(members.tolist())
-        internal_edges = subgraph.ecount()
-        vol_c = sum(g.degree(m) for m in members.tolist())
-        cut_c = vol_c - 2 * internal_edges
-        vol_complement = total_vol - vol_c
-        denom = min(vol_c, vol_complement)
+    # Volume per cluster: sum of degrees of members — O(N)
+    valid_mask = labels >= 0
+    vol_per_cluster = np.zeros(max_cid + 1, dtype=np.float64)
+    np.add.at(vol_per_cluster, labels[valid_mask], degrees[valid_mask].astype(np.float64))
 
-        if denom > 0:
-            conductances.append(cut_c / denom)
-        else:
-            conductances.append(0.0)
-        sizes.append(n_members)
+    vol_c = vol_per_cluster[cluster_ids]
+    cut_c = vol_c - 2.0 * internal_counts[cluster_ids].astype(np.float64)
+    vol_complement = total_vol - vol_c
+    denom = np.minimum(vol_c, vol_complement)
 
-    if not conductances:
+    cond_values = np.where(denom > 0, cut_c / denom, 0.0)
+
+    # Filter to clusters with >= 1 member (matching original skip logic)
+    valid = sizes_arr >= 1
+    if not valid.any():
         return 0.0
 
-    weights = np.array(sizes, dtype=np.float64)
-    mean_cond = float(np.average(conductances, weights=weights))
+    mean_cond = float(np.average(cond_values[valid], weights=sizes_arr[valid]))
     mean_cond = max(0.0, min(1.0, mean_cond))
     return 1.0 - mean_cond
 
@@ -91,47 +89,6 @@ def _consensus_nmi(g, resolution, objective_function="CPM", n_runs=5, base_seed=
 
 
 # ---------------------------------------------------------------------------
-#  Elbow detection (simple second-derivative / kneedle-lite)
-# ---------------------------------------------------------------------------
-
-def _find_elbow(values):
-    """Return the index of the elbow point in a sorted-descending score array.
-
-    Uses a simplified kneedle approach: normalise the curve to [0,1] on both
-    axes, compute the perpendicular distance of each point from the line
-    connecting the first and last points, and return the index of the maximum
-    distance.
-    """
-    n = len(values)
-    if n <= 2:
-        return 0
-
-    x = np.linspace(0.0, 1.0, n)
-    y_min, y_max = float(np.min(values)), float(np.max(values))
-    if y_max - y_min < 1e-12:
-        return 0
-    y = (np.array(values, dtype=np.float64) - y_min) / (y_max - y_min)
-
-    # Line from first to last point
-    p1 = np.array([x[0], y[0]])
-    p2 = np.array([x[-1], y[-1]])
-    line_vec = p2 - p1
-    line_len = np.linalg.norm(line_vec)
-    if line_len < 1e-12:
-        return 0
-    line_unit = line_vec / line_len
-
-    dists = np.zeros(n)
-    for i in range(n):
-        pt = np.array([x[i], y[i]]) - p1
-        proj = np.dot(pt, line_unit)
-        closest = p1 + proj * line_unit
-        dists[i] = np.linalg.norm(np.array([x[i], y[i]]) - closest)
-
-    return int(np.argmax(dists))
-
-
-# ---------------------------------------------------------------------------
 #  Main scorer & selector
 # ---------------------------------------------------------------------------
 
@@ -140,7 +97,6 @@ def score_and_select_scales(
     multiscale_result,
     snn_graph_result,
     *,
-    selection_policy="best_composite",
     consensus_runs=5,
     seed=0,
     objective_function="CPM",
@@ -157,13 +113,6 @@ def score_and_select_scales(
         Default ``1/3``.  Used as a Gaussian penalty centre, not a hard gate.
     max_selected_levels : int or None
         Maximum number of levels to retain.  Default ``6``.
-    selection_policy : str
-        ``"best_composite"`` — default composite scorer with target-aware
-        banding.
-        ``"elbow"`` — retain all levels above the elbow in the composite
-        score curve.
-        ``"max_stability"`` — pick the top N levels by consensus-stability
-        alone.
     """
     log = logger or logging.getLogger("multiscale")
 
@@ -177,13 +126,25 @@ def score_and_select_scales(
     g = snn_graph_result["graph"]
     N = snn_graph_result["n_nodes"]
 
-    log.info(f"Step 4: Scoring stability across {n_levels} levels (policy={selection_policy})")
+    log.info(f"Step 4: Scoring stability across {n_levels} levels")
     target_K = max(N * target_cluster_ratio, 10.0)
     target_avg_size = N / target_K
     singleton_tolerance = 0.10
 
     per_level_scores = []
     feasible_indices = []
+
+    # Pre-compute edge endpoints and degrees for vectorized graph metrics
+    _edge_list = g.get_edgelist()
+    if _edge_list:
+        _edge_arr = np.array(_edge_list, dtype=np.int64)
+        _edge_sources = _edge_arr[:, 0]
+        _edge_targets = _edge_arr[:, 1]
+    else:
+        _edge_sources = np.array([], dtype=np.int64)
+        _edge_targets = np.array([], dtype=np.int64)
+    _degrees = np.array(g.degree(), dtype=np.int64)
+    _total_vol = 2 * g.ecount()
 
     for lev_idx in range(n_levels):
         labels = levels[lev_idx]["labels"]
@@ -203,32 +164,51 @@ def score_and_select_scales(
         count_ratio = n_clusters / max(prev_k, 1)
 
         cluster_ids = np.unique(labels[labels >= 0])
-        densities = []
-        for cid in cluster_ids:
-            members = np.where(labels == cid)[0]
-            n_members = len(members)
-            if n_members < 2:
-                densities.append(0.0)
-                continue
-            possible_edges = n_members * (n_members - 1) / 2
-            subgraph = g.subgraph(members.tolist())
-            actual_edges = subgraph.ecount()
-            densities.append(actual_edges / possible_edges if possible_edges > 0 else 0.0)
 
         if cluster_ids.size > 0:
-            sizes_arr = np.array([np.sum(labels == cid) for cid in cluster_ids], dtype=np.float64)
-            cohesion = float(np.average(densities, weights=sizes_arr))
+            max_cid = int(cluster_ids.max())
+            _valid = labels >= 0
+
+            # Cluster sizes via bincount — O(N) instead of O(K*N)
+            sizes_full = np.bincount(labels[_valid], minlength=max_cid + 1)
+            sizes_arr = sizes_full[cluster_ids].astype(np.float64)
+
+            # Internal edges per cluster via single edge walk — O(E) instead of K subgraphs
+            if _edge_sources.size > 0:
+                _cs = labels[_edge_sources]
+                _ct = labels[_edge_targets]
+                _int_mask = (_cs >= 0) & (_cs == _ct)
+                if _int_mask.any():
+                    internal_counts = np.bincount(_cs[_int_mask], minlength=max_cid + 1)
+                else:
+                    internal_counts = np.zeros(max_cid + 1, dtype=np.int64)
+            else:
+                internal_counts = np.zeros(max_cid + 1, dtype=np.int64)
+
+            # Cohesion: vectorized density = internal_edges / possible_edges
+            n_members_arr = sizes_full[cluster_ids]
+            possible_arr = n_members_arr * (n_members_arr - 1) / 2.0
+            internal_arr = internal_counts[cluster_ids].astype(np.float64)
+            densities_arr = np.where(possible_arr > 0, internal_arr / possible_arr, 0.0)
+            cohesion = float(np.average(densities_arr, weights=sizes_arr))
+
+            n_size1_clusters = int(np.sum(sizes_full[cluster_ids] == 1))
         else:
             cohesion = 0.0
+            sizes_arr = np.array([], dtype=np.float64)
+            n_size1_clusters = 0
+            internal_counts = np.zeros(0, dtype=np.int64)
 
         if feasible and n_clusters > 1:
-            separation = _compute_mean_conductance(labels, g, cluster_ids)
+            separation = _compute_mean_conductance_fast(
+                labels, cluster_ids, sizes_arr, internal_counts,
+                _degrees, _total_vol
+            )
         else:
             separation = 0.0
 
         avg_cluster_size = N / max(n_clusters, 1)
         size_reg = min(avg_cluster_size / target_avg_size, 1.0)
-        n_size1_clusters = sum(1 for cid in cluster_ids if np.sum(labels == cid) == 1)
         effective_singleton_ratio = (n_singletons + n_size1_clusters) / max(N, 1)
         frag_penalty = max(0.0, effective_singleton_ratio - singleton_tolerance)
 
@@ -330,20 +310,10 @@ def score_and_select_scales(
     #  Policy-based selection
     # ==================================================================
 
-    if selection_policy == "elbow":
-        selected = _select_elbow(
-            feasible_indices, composites, levels, max_selected_levels, log
-        )
-    elif selection_policy == "max_stability":
-        selected = _select_max_stability(
-            feasible_indices, per_level_scores, levels, max_selected_levels, log
-        )
-    else:
-        # best_composite (default)
-        selected = _select_best_composite(
-            feasible_indices, composites, levels, N, target_K,
-            max_selected_levels, log
-        )
+    selected = _select_best_composite(
+        feasible_indices, composites, levels, N, target_K,
+        max_selected_levels, log
+    )
 
     selected = sorted(set(selected), key=lambda i: levels[i]["n_clusters"])
     if not selected:
@@ -354,7 +324,6 @@ def score_and_select_scales(
     return {
         "per_level_scores": per_level_scores,
         "selected_levels": selected,
-        "policy_used": selection_policy,
         "feasible_indices": feasible_indices,
     }
 
@@ -442,52 +411,3 @@ def _select_best_composite(feasible_indices, composites, levels, N, target_K,
         ])
     )
     return selected
-
-
-def _select_elbow(feasible_indices, composites, levels, max_selected_levels, log):
-    """Select all feasible levels above the elbow in the composite curve."""
-    if not feasible_indices:
-        return []
-
-    feas_composites = np.array([composites[i] for i in feasible_indices])
-    sorted_order = np.argsort(-feas_composites)  # descending
-    sorted_scores = feas_composites[sorted_order]
-
-    elbow_pos = _find_elbow(sorted_scores)
-    # Keep everything at or above the elbow
-    n_keep = min(elbow_pos + 1, max_selected_levels)
-    n_keep = max(n_keep, 1)
-
-    selected_feas = sorted_order[:n_keep]
-    selected = [feasible_indices[i] for i in selected_feas]
-
-    log.info(
-        f"  Elbow policy: elbow at rank {elbow_pos} "
-        f"(composite={sorted_scores[elbow_pos]:.3f}), keeping {n_keep} levels"
-    )
-    return selected
-
-
-def _select_max_stability(feasible_indices, per_level_scores, levels,
-                          max_selected_levels, log):
-    """Select the top N levels by consensus stability alone."""
-    if not feasible_indices:
-        return []
-
-    ranked = sorted(
-        feasible_indices,
-        key=lambda i: per_level_scores[i]["consensus"],
-        reverse=True,
-    )
-    selected = ranked[:max_selected_levels]
-
-    log.info(
-        f"  max_stability policy: top {len(selected)} by consensus NMI — "
-        + str([
-            {"idx": i, "K": levels[i]["n_clusters"],
-             "consensus": round(per_level_scores[i]["consensus"], 3)}
-            for i in selected
-        ])
-    )
-    return selected
-
